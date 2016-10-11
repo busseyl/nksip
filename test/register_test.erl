@@ -21,11 +21,15 @@
 %% -------------------------------------------------------------------
 
 -module(register_test).
+-include_lib("nklib/include/nklib.hrl").
+-include_lib("nkpacket/include/nkpacket.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 -include("../include/nksip.hrl").
+-include("../plugins/include/nksip_registrar.hrl").
 
 -compile([export_all]).
+-define(RECV(T), receive T -> T after 1000 -> error(recv) end).
 
 register_test_() ->
     {setup, spawn, 
@@ -41,23 +45,23 @@ register_test_() ->
 start() ->
     tests_util:start_nksip(),
 
-    {ok, _} = nksip:start(server1, ?MODULE, server1, [
-        {from, "sip:server1@nksip"},
-        registrar,
-        {transports, [{udp, all, 5060}, {tls, all, 5061}]},
-        {supported, "100rel,timer,path"},        % No outbound
-        {registrar_min_time, 60}
+    ok = tests_util:start(server1, ?MODULE, [
+        {sip_from, "sip:server1@nksip"},
+        {sip_registrar_min_time, 60},
+        {sip_supported, "100rel,timer,path"},        % No outbound
+        {plugins, [nksip_registrar]},
+        {transports, "sip:all:5060, <sip:all:5061;transport=tls>"}
     ]),
 
-    {ok, _} = nksip:start(client1, ?MODULE, client1, [
-        {from, "sip:client1@nksip"},
-        {local_host, "127.0.0.1"},
-        {transports, [{udp, all, 5070}, {tls, all, 5071}]},
-        {supported, "100rel,timer,path"}        % No outbound
+    ok = tests_util:start(client1, ?MODULE, [
+        {sip_from, "sip:client1@nksip"},
+        {sip_local_host, "127.0.0.1"},
+        {sip_supported, "100rel,timer,path"},       % No outbound
+        {transports, ["<sip:all:5070>", "<sip:all:5071;transport=tls>"]}
     ]),
 
-    {ok, _} = nksip:start(client2, ?MODULE, client2, [
-        {from, "sip:client2@nksip"}]),
+    ok = tests_util:start(client2, ?MODULE, [
+        {sip_from, "sip:client2@nksip"}]),
 
     tests_util:log(),
     ?debugFmt("Starting ~p", [?MODULE]).
@@ -69,54 +73,58 @@ stop() ->
 
 
 register1() ->
-    Min = nksip_config:get(registrar_min_time),
-    MinB = nksip_lib:to_binary(Min),
-    Max = nksip_config:get(registrar_max_time),
-    MaxB = nksip_lib:to_binary(Max),
-    Def = nksip_config:get(registrar_default_time),
-    DefB = nksip_lib:to_binary(Def),
+    Spec = nkservice_server:get_spec(server1),
+    Min = maps:get(sip_registrar_min_time, Spec),
+    MinB = nklib_util:to_binary(Min),
+    Max = maps:get(sip_registrar_max_time, Spec),
+    MaxB = nklib_util:to_binary(Max),
+    Def = maps:get(sip_registrar_default_time, Spec),
+    DefB = nklib_util:to_binary(Def),
     
     % Method not allowed
     {ok, 405, []} = nksip_uac:register(client2, "sip:127.0.0.1:5070", []),
 
     {ok, 200, Values1} = nksip_uac:register(client1, "sip:127.0.0.1", 
-                        [unregister_all, {meta, [<<"contact">>]}]),
+                            [unregister_all, {meta, [<<"contact">>]}]),
     [{<<"contact">>, []}] = Values1,
     [] = nksip_registrar:find(server1, sip, <<"client1">>, <<"nksip">>),
     
     Ref = make_ref(),
     Self = self(),
-    RespFun = fun(Reply) -> Self ! {Ref, Reply} end,
+
+    CB = fun(Term) ->
+        case Term of
+            ({req, Req1, _Call}) ->
+                FCallId1 = nksip_sipmsg:meta(call_id, Req1),
+                {ok, FCSeq1} = nksip_request:meta(cseq_num, Req1),
+                Self ! {Ref, {cb1_1, FCallId1, FCSeq1}};
+            ({resp, 200, Resp1, _Call}) ->
+                {ok, [FContact1]} = nksip_response:header(<<"contact">>, Resp1),
+                Self ! {Ref, {cb1_2, FContact1}}
+        end
+    end,
     {async, _} = nksip_uac:register(client1, "sip:127.0.0.1", 
-                                [async, {callback, RespFun}, contact, get_request,
-                                 {meta, [<<"contact">>]}, {supported, ""}]),
-    [CallId, CSeq] = receive 
-        {Ref, {req, Req2}} -> nksip_sipmsg:fields(Req2, [call_id, cseq_num])
-        after 2000 -> error(register1)
-    end,
-    Contact2 = receive 
-        {Ref, {ok, 200, [{<<"contact">>, [C2]}]}} -> C2
-        after 2000 -> error(register1) 
-    end,
+                                    [async, {callback, CB}, contact, get_request]),
+    {_, {_, CallId, CSeq}} = ?RECV({Ref, {cb1_1, CallId_0, CSeq_0}}),
+    {_, {_, Contact}} = ?RECV({Ref, {cb1_2, Contact_0}}),
 
     Name = <<"client1">>,
     [#uri{
         user = Name, 
         domain = Domain, 
-        port = Port, 
+        port = Port,
         ext_opts=[{<<"+sip.instance">>, _}, {<<"expires">>, DefB}]
     }] = 
         nksip_registrar:find(server1, sip, <<"client1">>, <<"nksip">>),
-    {ok, UUID} = nksip:get_uuid(client1),
+    UUID = nksip:get_uuid(client1),
     C1_UUID = <<$", UUID/binary, $">>,
     MakeContact = fun(Exp) ->
         list_to_binary([
-            "<sip:", Name, "@", Domain, ":", nksip_lib:to_binary(Port),
+            "<sip:", Name, "@", Domain, ":", nklib_util:to_binary(Port),
             ">;+sip.instance=", C1_UUID, ";expires=", Exp])
         end,
 
-    Contact2 = MakeContact(DefB),
-
+    Contact = MakeContact(DefB),
 
     {ok, 400, Values3} = nksip_uac:register(client1, "sip:127.0.0.1", 
                                     [{call_id, CallId}, {cseq_num, CSeq}, contact,
@@ -142,7 +150,7 @@ register1() ->
         nksip_registrar:find(server1, sip, <<"client1">>, <<"nksip">>),
 
     Opts5 = [{expires, Min}, contact, {meta, [<<"contact">>]}],
-    ExpB = nksip_lib:to_binary(Min),
+    ExpB = nklib_util:to_binary(Min),
     {ok, 200, Values6} = nksip_uac:register(client1, "sip:127.0.0.1", Opts5),
     [{_, [Contact6]}] = Values6,
     Contact6 = MakeContact(ExpB),
@@ -150,36 +158,37 @@ register1() ->
           ext_opts=[{<<"+sip.instance">>, _}, {<<"expires">>, ExpB}]}] = 
         nksip_registrar:find(server1, sip, <<"client1">>, <<"nksip">>),
 
-    Expire = nksip_lib:timestamp()+Min,
+    {ok, Registrar} = nkservice_server:get_srv_id(server1),
+    Expire = nklib_util:timestamp()+Min,
     [#reg_contact{
             contact = #uri{
                 user = <<"client1">>, domain=Domain, port=Port, 
                 ext_opts=[{<<"+sip.instance">>, C1_UUID}, {<<"expires">>, ExpB}]}, 
             expire = Expire,
             q = 1.0
-    }] = nksip_registrar:get_info(server1, sip, <<"client1">>, <<"nksip">>),
+    }] = nksip_registrar_lib:get_info(Registrar, sip, <<"client1">>, <<"nksip">>),
 
 
 
-    % true = lists:member(Reg1, nksip_registrar:internal_get_all()),
+    % true = lists:member(Reg1, nksip_registrar_util:get_all()),
 
     % Simulate a request coming at the server from 127.0.0.1:Port, 
     % From is sip:client1@nksip,
     Request1 = #sipmsg{
-                app_id = element(2, nksip:find_app(server1)), 
+                srv_id = element(2, nkservice_server:get_srv_id(server1)), 
                 from = {#uri{scheme=sip, user= <<"client1">>, domain= <<"nksip">>}, <<>>},
-                transport = #transport{
-                                proto = udp, 
+                nkport = #nkport{
+                                transp = udp, 
                                 remote_ip = {127,0,0,1}, 
                                 remote_port=Port}},
 
     true = nksip_registrar:is_registered(Request1),
 
-    {ok, Ip} = nksip_lib:to_ip(Domain),
+    {ok, Ip} = nklib_util:to_ip(Domain),
     
     % Now coming from the Contact's registered address
-    Request2 = Request1#sipmsg{transport=(Request1#sipmsg.transport)
-                                                #transport{remote_ip=Ip}},
+    Request2 = Request1#sipmsg{nkport=(Request1#sipmsg.nkport)
+                                                #nkport{remote_ip=Ip}},
     true = nksip_registrar:is_registered(Request2),
 
     ok = nksip_registrar:delete(server1, sip, <<"client1">>, <<"nksip">>),
@@ -188,7 +197,7 @@ register1() ->
 
 
 register2() ->
-    nksip_registrar:internal_clear(),
+    nksip_registrar_util:clear(),
 
     Opts1 = [contact, {expires, 300}],
     FromS = {from, <<"sips:client1@nksip">>},
@@ -213,7 +222,7 @@ register2() ->
     {ok, 200, []} = nksip_uac:register(client1, "sip:127.0.0.1", 
                     [{contact, "tel:123456"}, {expires, 300}]),
 
-    {ok, UUID1} = nksip:get_uuid(client1),
+    UUID1 = nksip:get_uuid(client1),
     QUUID1 = <<$", UUID1/binary, $">>,
 
     % Now we register a different AOR (with sips)
@@ -223,11 +232,11 @@ register2() ->
                         [{contact, ManualContact}, {from, "sips:client1@nksip"},
                          {meta, [<<"contact">>]}, {expires, 300}]),
     [{<<"contact">>, Contact3}] = Values3,
-    Contact3Uris = nksip_parse:uris(Contact3),
+    Contact3Uris = nklib_parse:uris(Contact3),
 
     {ok, 200, Values4} = nksip_uac:register(client1, "sip:127.0.0.1", 
-                                            [{meta,[parsed_contacts]}]),
-    [{parsed_contacts, Contacts4}] = Values4, 
+                                            [{meta,[contacts]}]),
+    [{contacts, Contacts4}] = Values4, 
     [
         #uri{scheme=sip, port=5070, opts=[], 
              ext_opts=[{<<"+sip.instance">>, QUUID1}, {<<"expires">>, <<"300">>}]},
@@ -288,28 +297,27 @@ register2() ->
 %%%%%%%%%%%%%%%%%%%%%%%  CallBacks (servers and clients) %%%%%%%%%%%%%%%%%%%%%
 
 
-init(Id) ->
-    nksip:put(Id, domains, [<<"nksip">>, <<"127.0.0.1">>, <<"[::1]">>]),
-    {ok, Id}.
+init(#{name:=Id}, State) ->
+    ok = nkservice_server:put(Id, domains, [<<"nksip">>, <<"127.0.0.1">>, <<"[::1]">>]),
+    {ok, State}.
 
-route(_ReqId, Scheme, User, Domain, _From, AppId=State) when AppId==server1 ->
-    Opts = [
-        record_route,
-        {insert, "x-nk-server", AppId}
-    ],
-    {ok, Domains} = nksip:get(server1, domains),
-    case lists:member(Domain, Domains) of
-        true when User =:= <<>> ->
-            {reply, {process, Opts}, State};
-        true when Domain =:= <<"nksip">> ->
-            case nksip_registrar:find(server1, Scheme, User, Domain) of
-                [] -> {reply, temporarily_unavailable, State};
-                UriList -> {reply, {proxy, UriList, Opts}, State}
+
+sip_route(Scheme, User, Domain, Req, _Call) ->
+    case nksip_request:srv_name(Req) of
+        {ok, server1} ->
+            Opts = [record_route, {insert, "x-nk-server", server1}],
+            Domains = nkservice_server:get(server1, domains),
+            case lists:member(Domain, Domains) of
+                true when User =:= <<>> ->
+                    process;
+                true when Domain =:= <<"nksip">> ->
+                    case nksip_registrar:find(server1, Scheme, User, Domain) of
+                        [] -> {reply, temporarily_unavailable};
+                        UriList -> {proxy, UriList, Opts}
+                    end;
+                _ ->
+                    {proxy, ruri, Opts}
             end;
-        _ ->
-            {reply, {proxy, ruri, Opts}, State}
-    end;
-
-route(_, _, _, _, _, State) ->
-    {reply, process, State}.
-
+        {ok, _} ->
+            process
+    end.

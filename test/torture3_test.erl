@@ -22,6 +22,8 @@
 %% -------------------------------------------------------------------
 
 -module(torture3_test).
+-include_lib("nklib/include/nklib.hrl").
+-include_lib("nkpacket/include/nkpacket.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 -include("../include/nksip.hrl").
@@ -57,10 +59,10 @@ torture3_test_() ->
 start() ->
     tests_util:start_nksip(),
 
-    {ok, _} = nksip:start(server1, ?MODULE, server1, [
-        {transports, [{udp, all, 5060}]},
-        registrar,
-        no_100
+    ok = tests_util:start(server1, ?MODULE, [
+        {sip_no_100, true},
+        {transports, "sip:all:5060"},
+        {plugins, [nksip_registrar]}
     ]),
 
     tests_util:log(),
@@ -85,7 +87,7 @@ transaction_1() ->
         "\r\n">>,
     #sipmsg{vias=[#via{opts = [{<<"branch">>,<<"z9hG4bK">>}]}]} = Req = parse(Msg),
     % It is detected as a pre-RFC3261 tag
-    true = nksip_call_uas:transaction_id(Req) < 0,
+    true = nksip_call_lib:uas_transaction_id(Req) < 0,
     ok.
 
 
@@ -210,8 +212,8 @@ application_7() ->
         "Content-Length:0\r\n"
         "\r\n">>,
     Req = #sipmsg{} = parse(Msg),
-    % No authentication token found
-    [] = nksip_auth:get_authentication(Req, fun(_, _) -> <<"1234">> end),
+    % No valid authentication token found
+    [{{digest,<<>>},invalid}] = nksip_auth:get_authentication(Req, fun(_, _) -> <<"1234">> end),
     ok.
 
     
@@ -424,7 +426,8 @@ application_15() ->
 %% Internal
 
 parse(Msg) ->
-    case nksip_parse:packet(test, #transport{proto=udp}, Msg) of
+    {ok, SrvId} = nkservice_server:get_srv_id(server1),
+    case nksip_parse:packet(SrvId, #nkport{transp=udp}, Msg) of
         {ok, SipMsg, <<>>} -> SipMsg;
         {ok, SipMsg, Tail} -> {tail, SipMsg, Tail};
         partial -> partial;
@@ -450,15 +453,13 @@ send(tcp, Msg) ->
 %%%%%%%%%%%%%%%%%%%%%%%  CallBacks %%%%%%%%%%%%%%%%%%%%%
 
 
-init(Id) ->
-    {ok, Id}.
-
-route(_ReqId, Scheme, _User, _Domain, _From, server1=State)
-      when Scheme=/=sip, Scheme=/=sips ->
-    {reply, unsupported_uri_scheme, State};
-
-route(_, _, _, _, _, State) ->
-    {reply, process, State}.
+sip_route(Scheme, _User, _Domain, Req, _Call) ->
+    case nksip_request:srv_name(Req) of
+        {ok, server1} when Scheme=/=sip, Scheme=/=sips ->
+            {reply, unsupported_uri_scheme};
+        {ok, _} ->
+            process
+    end.
 
 
 

@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -40,11 +40,11 @@
 %% ===================================================================
 
 %% @doc Starts a new call process.
--spec start(nksip:app_id(), nksip:call_id()) ->
+-spec start(nksip:srv_id(), nksip:call_id()) ->
     {ok, pid()}.
 
-start(AppId, CallId) ->
-    gen_server:start(?MODULE, [AppId, CallId], []).
+start(SrvId, CallId) ->
+    gen_server:start(?MODULE, [SrvId, CallId], []).
 
 
 %% @doc Stops a call (deleting  all associated transactions, dialogs and forks!).
@@ -55,17 +55,17 @@ stop(Pid) ->
     gen_server:cast(Pid, stop).
 
 
-%% @doc Sends a synchronous piece of {@link nksip_call:work()} to the call.
-%% After receiving the work, the call will send `{sync_work_ok, Ref}' to `Sender'
--spec sync_work(pid(), reference(), pid(), nksip_call:work(), from()|none) ->
+%% @doc Sends a synchronous piece of {@link nksip_call_worker:work()} to the call.
+%% After receiving the work, the call will send `{sync_work_received, Ref}' to `Sender'
+-spec sync_work(pid(), reference(), pid(), nksip_call_worker:work(), {pid(), term()}|none) ->
     ok.
 
 sync_work(Pid, Ref, Sender, Work, From) ->
     gen_server:cast(Pid, {sync_work, Ref, Sender, Work, From}).
 
 
-%% @doc Sends an asynchronous piece of {@link nksip_call:work()} to the call.
--spec async_work(pid(), nksip_call:work()) ->
+%% @doc Sends an asynchronous piece of {@link nksip_call_worker:work()} to the call.
+-spec async_work(pid(), nksip_call_worker:work()) ->
     ok.
 
 async_work(Pid, Work) ->
@@ -84,13 +84,14 @@ get_data(Pid) ->
 
 %% @private 
 -spec init(term()) ->
-    gen_server_init(call()).
+    {ok, call()}.
 
-init([AppId, CallId]) ->
-    nksip_counters:async([nksip_calls]),
+init([SrvId, CallId]) ->
+    nklib_counters:async([nksip_calls, {nksip_calls, SrvId}]),
     Id = erlang:phash2(make_ref()) * 1000,
+    #call_timers{trans=TransTime} = Timers = SrvId:cache_sip_times(),
     Call = #call{
-        app_id = AppId, 
+        srv_id = SrvId, 
         call_id = CallId, 
         next = Id+1,
         hibernate = false,
@@ -100,37 +101,37 @@ init([AppId, CallId]) ->
         auths = [],
         msgs = [],
         events = [],
-        timers = AppId:config_timers()
+        timers = Timers
     },
-    nksip_config:put_log_cache(AppId, CallId),
-    erlang:start_timer(2000*?MAX_TRANS_TIME, self(), check_call),
-    ?call_debug("Call process ~p started (~p)", [Id, self()]),
+    nksip_util:put_log_cache(SrvId, CallId),
+    erlang:start_timer(2000 * TransTime, self(), check_call),
+    ?call_debug("call process ~p started (~p)", [Id, self()]),
     {ok, Call}.
 
 
 %% @private
--spec handle_call(term(), from(), call()) ->
-    gen_server_call(call()).
+-spec handle_call(term(), {pid(), term()}, call()) ->
+    {reply, term(), call()} | {noreply, call()}.
 
 handle_call(get_data, _From, Call) ->
     #call{trans=Trans, forks=Forks, dialogs=Dialogs} = Call,
     {reply, {Trans, Forks, Dialogs}, Call};
  
- handle_call(Msg, _From, Call) ->
+handle_call(Msg, _From, Call) ->
     lager:error("Module ~p received unexpected sync event: ~p", [?MODULE, Msg]),
     {noreply, Call}.
 
 
 %% @private
 -spec handle_cast(term(), call()) ->
-    gen_server_cast(call()).
+    {noreply, call()} | {stop, term(), call()}.
 
 handle_cast({sync_work, Ref, Pid, Work, From}, Call) ->
-    Pid ! {sync_work_ok, Ref},
-    next(nksip_call:work(Work, From, Call));
+    Pid ! {sync_work_received, Ref, self()},
+    next(nksip_call_worker:work(Work, From, Call));
 
 handle_cast({async_work, Work}, Call) ->
-    next(nksip_call:work(Work, none, Call));
+    next(nksip_call_worker:work(Work, none, Call));
 
 handle_cast(stop, Call) ->
     {stop, normal, Call};
@@ -142,13 +143,29 @@ handle_cast(Msg, Call) ->
 
 %% @private
 -spec handle_info(term(), call()) ->
-    gen_server_info(call()).
+    {noreply, call()} | {stop, term(), call()}.
+
+handle_info({timeout, _Ref, check_call}, Call) ->
+    Call1 = nksip_call:check_call(Call),
+    Timeout = 2000*(Call#call.timers)#call_timers.trans,
+    erlang:start_timer(Timeout, self(), check_call),
+    next(Call1);
 
 handle_info({timeout, Ref, Type}, Call) ->
-    next(nksip_call:timeout(Type, Ref, Call));
+    next(nksip_call_worker:timeout(Type, Ref, Call));
 
-handle_info(timeout, Call) ->
-    next(Call);
+% handle_info({'DOWN', _Ref, process, Pid, _Reason}=Info, #call{srv_id=SrvId}=Call) ->
+%     case whereis(SrvId) of
+%         undefined ->
+%             lager:warning("Srv ~p down1", [SrvId]),
+%             {stop, normal, Call};
+%         Pid ->
+%             lager:warning("Srv ~p down2", [SrvId]),
+%             {stop, normal, Call};
+%         _ ->
+%             lager:warning("Module ~p received unexpected info: ~p", [?MODULE, Info]),
+%             next(Call)
+%     end;
 
 handle_info(Info, Call) ->
     lager:warning("Module ~p received unexpected info: ~p", [?MODULE, Info]),
@@ -157,7 +174,7 @@ handle_info(Info, Call) ->
 
 %% @private
 -spec code_change(term(), call(), term()) ->
-    gen_server_code_change(call()).
+    {ok, call()}.
 
 code_change(_OldVsn, Call, _Extra) -> 
     {ok, Call}.
@@ -165,10 +182,10 @@ code_change(_OldVsn, Call, _Extra) ->
 
 %% @private
 -spec terminate(term(), call()) ->
-    gen_server_terminate().
+    ok.
 
 terminate(_Reason, #call{}) ->
-    ?call_debug("Call process stopped", []).
+    ?call_debug("call process stopped", []).
 
 
 
@@ -178,12 +195,14 @@ terminate(_Reason, #call{}) ->
 
 %% @private
 -spec next(call()) ->
-    gen_server_cast(call()).
+    {noreply, call()} | {stop, normal, call()}.
 
 next(#call{trans=[], forks=[], dialogs=[], events=[]}=Call) -> 
     case erlang:process_info(self(), message_queue_len) of
-        {_, 0} -> {stop, normal, Call};
-        _ -> {noreply, Call}
+        {_, 0} -> 
+            {stop, normal, Call};
+        _ -> 
+            {noreply, Call}
     end;
 
 next(#call{hibernate=Hibernate}=Call) -> 
@@ -191,7 +210,7 @@ next(#call{hibernate=Hibernate}=Call) ->
         false ->
             {noreply, Call};
         _ ->
-            ?call_debug("Call hibernating: ~p", [Hibernate]),
+            ?call_debug("call hibernating: ~p", [Hibernate]),
             {noreply, Call#call{hibernate=false}, hibernate}
     end.
 

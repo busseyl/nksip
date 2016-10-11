@@ -22,15 +22,44 @@
 
 -module(tests_util).
 
--export([start_nksip/0, empty/0, wait/2, log/0, log/1]).
--export([get_ref/0, save_ref/3, update_ref/3, send_ref/3, dialog_update/3, session_update/3]).
+-export([start_nksip/0, start/3, start_debug/3, empty/0, wait/2, log/0, log/1]).
+-export([get_ref/0, save_ref/1, update_ref/3, send_ref/2, dialog_update/2, session_update/2]).
 
--define(LOG_LEVEL, warning).    % debug, info, notice, warning, error
+-define(LOG_LEVEL, notice).    % debug, info, notice, warning, error
+
+-ifdef(is_travis).
+-define(WAIT_TIMEOUT, 100000).
+-else.
 -define(WAIT_TIMEOUT, 10000).
+-endif.
 
 start_nksip() ->
     nksip_app:start(),
-    log(info).
+    log().
+
+
+start(Name, Module, Opts) ->
+    Opts1 = nklib_util:to_map(Opts),
+    Opts2 = Opts1#{
+        callback => Module
+    },
+    {ok, _} = nksip:start(Name, Opts2),
+    ok.
+
+
+start_debug(Name, Module, Opts) ->
+    nklib_log:debug(),
+    Opts1 = nklib_util:to_map(Opts),
+    Plugins = maps:get(plugins, Opts1, []),
+    Opts2 = Opts1#{
+        plugins => [nksip_trace | Plugins],
+        callback => Module,
+        log_level => debug,
+        sip_trace => {console, all}
+    },
+    {ok, _} = nksip:start(Name, Opts2),
+    ok.
+
 
 empty() ->
     empty([]).
@@ -49,8 +78,12 @@ wait(Ref, List) ->
         {Ref, Term} -> 
             % io:format("-------RECEIVED ~p\n", [Term]),
             case lists:member(Term, List) of
-                true -> wait(Ref, List -- [Term]);
-                false -> {error, {unexpected_term, Term, List}}
+                true -> 
+                    wait(Ref, List -- [Term]);
+                false -> 
+                    lager:warning("Timer Test Wait unexpected term: ~p", [Term]),
+                    wait(Ref, List)
+                    % {error, {unexpected_term, Term, List}}
             end
     after   
         ?WAIT_TIMEOUT ->
@@ -72,74 +105,88 @@ get_ref() ->
     {Ref, Hd}.
 
 
-save_ref(AppId, ReqId, Meta) ->
-    case nksip_request:header(ReqId, <<"x-nk-reply">>) of
-        [RepBin] -> 
+save_ref(Req) ->
+    case nksip_request:header(<<"x-nk-reply">>, Req) of
+        {ok, [RepBin]} -> 
             {Ref, Pid} = erlang:binary_to_term(base64:decode(RepBin)),
-            {ok, Dialogs} = nksip:get(AppId, dialogs, []),
-            DialogId = nksip_lib:get_value(dialog_id, Meta),
-            ok = nksip:put(AppId, dialogs, [{DialogId, Ref, Pid}|Dialogs]);
+            {ok, SrvId} = nksip_request:srv_id(Req),
+            Dialogs = nkservice_server:get(SrvId, dialogs, []),
+            {ok, DialogId} = nksip_dialog:get_handle(Req),
+            ok = nkservice_server:put(SrvId, dialogs, [{DialogId, Ref, Pid}|Dialogs]);
+        {ok, _O} ->
+            ok
+    end.
+
+
+update_ref(SrvId, Ref, DialogId) ->
+    Dialogs = nkservice_server:get(SrvId, dialogs, []),
+    ok = nkservice_server:put(SrvId, dialogs, [{DialogId, Ref, self()}|Dialogs]).
+
+
+send_ref(Msg, Req) ->
+    {ok, DialogId} = nksip_dialog:get_handle(Req),
+    {ok, SrvId} = nksip_request:srv_id(Req),
+    Dialogs = nkservice_server:get(SrvId, dialogs, []),
+    case lists:keyfind(DialogId, 1, Dialogs) of
+        {DialogId, Ref, Pid}=_D -> 
+            % lager:warning("FOUND ~p, ~p", [SrvId, _D]),
+            Pid ! {Ref, {SrvId:name(), Msg}};
+        false ->
+            % lager:warning("NOT FOUND: ~p", [SrvId]),
+            ok
+    end.
+
+dialog_update(Update, Dialog) ->
+    {ok, SrvId} = nksip_dialog:srv_id(Dialog),
+    case catch nkservice_server:get(SrvId, dialogs, []) of
+        Dialogs when is_list(Dialogs) ->
+            {ok, DialogId} = nksip_dialog:get_handle(Dialog),
+            case lists:keyfind(DialogId, 1, Dialogs) of
+                {DialogId, Ref, Pid} ->
+                    SrvName = SrvId:name(),
+                    case Update of
+                        start -> ok;
+                        target_update -> Pid ! {Ref, {SrvName, target_update}};
+                        {invite_status, confirmed} -> Pid ! {Ref, {SrvName, dialog_confirmed}};
+                        {invite_status, {stop, Reason}} -> Pid ! {Ref, {SrvName, {dialog_stop, Reason}}};
+                        {invite_status, _} -> ok;
+                        {invite_refresh, SDP} -> Pid ! {Ref, {SrvName, {refresh, SDP}}};
+                        invite_timeout -> Pid ! {Ref, {SrvName, timeout}};
+                        {subscription_status, Status, Subs} -> 
+                            {ok, Handle} = nksip_subscription:get_handle(Subs),
+                            Pid ! {Ref, {subs, Status, Handle}};
+                        stop -> ok
+                    end;
+                false -> 
+                    none
+            end;
         _ ->
             ok
     end.
 
 
-update_ref(AppId, Ref, DialogId) ->
-    {ok, Dialogs} = nksip:get(AppId, dialogs, []),
-    ok = nksip:put(AppId, dialogs, [{DialogId, Ref, self()}|Dialogs]).
-
-
-send_ref(AppId, Meta, Msg) ->
-    DialogId = nksip_lib:get_value(dialog_id, Meta),
-    {ok, Dialogs} = nksip:get(AppId, dialogs, []),
-    case lists:keyfind(DialogId, 1, Dialogs) of
-        {DialogId, Ref, Pid}=_D -> 
-            % lager:warning("FOUND ~p, ~p", [AppId, D]),
-            Pid ! {Ref, {AppId, Msg}};
-        false ->
-            % lager:warning("NOT FOUND: ~p", [AppId]),
-            ok
-    end.
-
-dialog_update(DialogId, Update, AppId) ->
-    {ok, Dialogs} = nksip:get(AppId, dialogs, []),
-    case lists:keyfind(DialogId, 1, Dialogs) of
-        {DialogId, Ref, Pid} ->
-            case Update of
-                start -> ok;
-                target_update -> Pid ! {Ref, {AppId, target_update}};
-                {invite_status, confirmed} -> Pid ! {Ref, {AppId, dialog_confirmed}};
-                {invite_status, {stop, Reason}} -> Pid ! {Ref, {AppId, {dialog_stop, Reason}}};
-                {invite_status, _} -> ok;
-                {invite_refresh, SDP} -> Pid ! {Ref, {AppId, {refresh, SDP}}};
-                invite_timeout -> Pid ! {Ref, {AppId, timeout}};
-                {subscription_status, SubsId, Status} -> Pid ! {Ref, {subs, SubsId, Status}};
-                stop -> ok
-            end;
-        false -> 
-            none
-    end.
-
-
-session_update(DialogId, Update, AppId) ->
-    {ok, Dialogs} = nksip:get(AppId, dialogs, []),
+session_update(Update, Dialog) ->
+    {ok, SrvId} = nksip_dialog:srv_id(Dialog),
+    Dialogs = nkservice_server:get(SrvId, dialogs, []),
+    {ok, DialogId} = nksip_dialog:get_handle(Dialog),
     case lists:keyfind(DialogId, 1, Dialogs) of
         false -> 
             ok;
         {DialogId, Ref, Pid} ->
+            SrvName = SrvId:name(),
             case Update of
                 {start, Local, Remote} ->
-                    Pid ! {Ref, {AppId, sdp_start}},
-                    {ok, Sessions} = nksip:get(AppId, sessions, []),
-                    nksip:put(AppId, sessions, [{DialogId, Local, Remote}|Sessions]),
+                    Pid ! {Ref, {SrvName, sdp_start}},
+                    Sessions = nkservice_server:get(SrvId, sessions, []),
+                    nkservice_server:put(SrvId, sessions, [{DialogId, Local, Remote}|Sessions]),
                     ok;
                 {update, Local, Remote} ->
-                    Pid ! {Ref, {AppId, sdp_update}},
-                    {ok, Sessions} = nksip:get(AppId, sessions, []),
-                    nksip:put(AppId, sessions, [{DialogId, Local, Remote}|Sessions]),
+                    Pid ! {Ref, {SrvName, sdp_update}},
+                    Sessions = nkservice_server:get(SrvId, sessions, []),
+                    nkservice_server:put(SrvId, sessions, [{DialogId, Local, Remote}|Sessions]),
                     ok;
                 stop ->
-                    Pid ! {Ref, {AppId, sdp_stop}},
+                    Pid ! {Ref, {SrvName, sdp_stop}},
                     ok
             end
     end.

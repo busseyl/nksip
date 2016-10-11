@@ -1,7 +1,7 @@
 %%
 %% nksip.hrl: Common types and records definition
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -26,62 +26,56 @@
 %% Defines
 %% ===================================================================
 
--define(VERSION, "0.4.0").
--define(SUPPORTED, [<<"100rel">>, <<"timer">>, <<"path">>, <<"outbound">>, <<"gruu">>]).
--define(ACCEPT, [{<<"*/*">>, []}]).
--define(ALLOW, <<"INVITE,ACK,CANCEL,BYE,OPTIONS,INFO,PRACK,UPDATE,"
-                 "SUBSCRIBE,NOTIFY,REFER,MESSAGE,PUBLISH">>).
+-define(VERSION, "0.5.0").
 
--define(MSG_ROUTERS, 8).
--define(SRV_TIMEOUT, 45000).
--define(DEFAULT_TCP_KEEPALIVE, 120).
--define(DEFAULT_UDP_KEEPALIVE, 25).
--define(DEFAULT_EVENT_EXPIRES, 60).
--define(DEFAULT_PUBLISH_EXPIRES, 60).
+-define(
+    DO_LOG(Level, Srv, CallId, Text, Opts),
+    case CallId of
+        <<>> ->
+            lager:Level([{app, Srv}], "~p "++Text, [Srv|Opts]);
+        _ -> 
+            lager:Level([{app, Srv}, {call_id, CallId}], "~p (~s) "++Text, [Srv, CallId|Opts])
+    end).
 
-
-
-% Maximum transaction time (15min)
--define(MAX_TRANS_TIME, 15*60).
-
-% Maximum time in dialogs between updates (30min)
--define(MAX_DIALOG_TIME, 30*60).
+-define(DO_DEBUG(SrvId, CallId, Level, Text, List),
+    case SrvId:cache_sip_debug() of
+        false -> ok;
+        _ -> SrvId:nks_sip_debug(SrvId, CallId, {Level, Text, List})
+    end).
 
 
-
-
--define(DO_LOG(Level, App, CallId, Text, Opts),
-    lager:Level([{app, App}, {call_id, CallId}], "~p (~s) "++Text, [App, CallId|Opts])).
-
-
-
--define(debug(AppId, CallId, Text, List), 
-    case AppId:config_log_level() >= 8 of
-        true -> ?DO_LOG(debug, AppId:name(), CallId, Text, List);
+-define(debug(SrvId, CallId, Text, List), 
+    ?DO_DEBUG(SrvId, CallId, debug, Text, List),
+    case SrvId:cache_log_level() >= 8 of
+        true -> ?DO_LOG(debug, SrvId:name(), CallId, Text, List);
         false -> ok
     end).
 
--define(info(AppId, CallId, Text, List), 
-    case AppId:config_log_level() >= 7 of
-        true -> ?DO_LOG(info, AppId:name(), CallId, Text, List);
+-define(info(SrvId, CallId, Text, List), 
+    ?DO_DEBUG(SrvId, CallId, info, Text, List),
+    case SrvId:cache_log_level() >= 7 of
+        true -> ?DO_LOG(info, SrvId:name(), CallId, Text, List);
         false -> ok
     end).
 
--define(notice(AppId, CallId, Text, List), 
-    case AppId:config_log_level() >= 6 of
-        true -> ?DO_LOG(notice, AppId:name(), CallId, Text, List);
+-define(notice(SrvId, CallId, Text, List), 
+    ?DO_DEBUG(SrvId, CallId, notice, Text, List),
+    case SrvId:cache_log_level() >= 6 of
+        true -> ?DO_LOG(notice, SrvId:name(), CallId, Text, List);
         false -> ok
     end).
 
--define(warning(AppId, CallId, Text, List), 
-    case AppId:config_log_level() >= 5 of
-        true -> ?DO_LOG(warning, AppId:name(), CallId, Text, List);
+-define(warning(SrvId, CallId, Text, List), 
+    ?DO_DEBUG(SrvId, CallId, warning, Text, List),
+    case SrvId:cache_log_level() >= 5 of
+        true -> ?DO_LOG(warning, SrvId:name(), CallId, Text, List);
         false -> ok
     end).
 
--define(error(AppId, CallId, Text, List), 
-    case AppId:config_log_level() >= 4 of
-        true -> ?DO_LOG(error, AppId:name(), CallId, Text, List);
+-define(error(SrvId, CallId, Text, List), 
+    ?DO_DEBUG(SrvId, CallId, error, Text, List),
+    case SrvId:cache_log_level() >= 4 of
+        true -> ?DO_LOG(error, SrvId:name(), CallId, Text, List);
         false -> ok
     end).
 
@@ -90,60 +84,18 @@
 -include_lib("kernel/include/inet_sctp.hrl").
 
 
-%% ===================================================================
-%% Types
-%% ===================================================================
-
--type from() :: term().
-
--type gen_server_time() :: 
-        non_neg_integer() | hibernate.
-
--type gen_server_init(State) ::
-        {ok, State} | {ok, State, gen_server_time()} | ignore.
-
--type gen_server_cast(State) :: 
-        {noreply, State} | {noreply, State, gen_server_time()} |
-        {stop, term(), State}.
-
--type gen_server_info(State) :: 
-        gen_server_cast(State).
-
--type gen_server_call(State) :: 
-        {reply, term(), State} | {reply, term(), State, gen_server_time()} |
-        {stop, term(), term(), State} | gen_server_cast(State).
-
--type gen_server_code_change(State) ::
-        {ok, State}.
-
--type gen_server_terminate() ::
-        ok.
-
-
 
 %% ===================================================================
 %% Records
 %% ===================================================================
 
 
--record(transport, {
-    proto = udp :: nksip:protocol(),
-    local_ip :: inet:ip_address(),
-    local_port :: inet:port_number(),
-    remote_ip :: inet:ip_address(),
-    remote_port :: inet:port_number(),
-    listen_ip :: inet:ip_address(),         % Ip this transport must report as listening
-    listen_port :: inet:port_number(),
-    sctp_id :: integer(),
-    resource = <<>> :: binary()      
-}).
-
 
 -record(sipmsg, {
     id :: nksip_sipmsg:id(),
-    class :: {req, nksip:method()} | {resp, nksip:response_code(), binary()},
-    app_id :: nksip:app_id(),
-    dialog_id :: nksip_dialog:id(),
+    class :: {req, nksip:method()} | {resp, nksip:sip_code(), binary()},
+    srv_id :: nkservice:service_id(),
+    dialog_id :: nksip_dialog_lib:id(),
     ruri :: nksip:uri(),
     vias = [] :: [nksip:via()],
     from :: {nksip:uri(), FromTag::binary()},
@@ -156,43 +108,61 @@
     content_type :: nksip:token() | undefined,
     require = [] :: [binary()],
     supported = [] :: [binary()],
-    expires :: non_neg_integer(),
+    expires :: non_neg_integer() | undefined,
     event :: nksip:token() | undefined,
     headers = [] :: [nksip:header()],
     body = <<>> :: nksip:body(),
     to_tag_candidate = <<>> :: nksip:tag(),
-    transport :: nksip_transport:transport(),
-    start :: nksip_lib:l_timestamp(),
-    meta = [] :: nksip_lib:optslist()   % No current use
+    nkport :: nkpacket:nkport(),
+    start :: nklib_util:l_timestamp(),
+    meta = [] :: nksip:optslist()   % No current use
 }).
 
 
 -record(reqreply, {
-    code = 200 :: nksip:response_code(),
+    code = 200 :: nksip:sip_code(),
     headers = [] :: [nksip:header()],
     body = <<>> :: nksip:body(),
-    opts = [] :: nksip_lib:optslist()
-}).
-
--record(uri, {
-    disp = <<>> :: binary(),
-    scheme = sip :: nksip:scheme(),
-    user = <<>> :: binary(), 
-    pass = <<>> :: binary(), 
-    domain = <<"invalid.invalid">> :: binary(), 
-    port = 0 :: inet:port_number(),             % 0 means "no port in message"
-    path = <<>> :: binary(),
-    opts = [] :: nksip_lib:optslist(),
-    headers = [] :: [binary()|nksip:header()],
-    ext_opts = [] :: nksip_lib:optslist(),
-    ext_headers = [] :: [binary()|nksip:header()]
+    opts = [] :: nksip:optslist()
 }).
 
 -record(via, {
-    proto = udp :: nksip:protocol(),
+    transp = udp :: nkpacket:transport(),
     domain = <<"invalid.invalid">> :: binary(),
     port = 0 :: inet:port_number(),
-    opts = [] :: nksip_lib:optslist()
+    opts = [] :: nksip:optslist()
+}).
+
+
+-record(invite, {
+    status :: nksip_dialog:invite_status(),
+    answered :: nklib_util:timestamp(),
+    class :: uac | uas | proxy,
+    request :: nksip:request(),
+    response :: nksip:response(),
+    ack :: nksip:request(),
+    local_sdp :: nksip_sdp:sdp(),
+    remote_sdp :: nksip_sdp:sdp(),
+    media_started :: boolean(),
+    sdp_offer :: nksip_call_dialog:sdp_offer(),
+    sdp_answer :: nksip_call_dialog:sdp_offer(),
+    timeout_timer :: reference(),
+    retrans_timer :: reference(),
+    next_retrans :: integer()
+}).
+
+
+-record(subscription, {
+    id :: nksip_subscription_lib:id(),
+    event :: nksip:token(),
+    expires :: pos_integer(),
+    status :: nksip_subscription:status(),
+    class :: uac | uas,
+    answered :: nklib_util:timestamp(),
+    timer_n :: reference(),
+    timer_expire :: reference(),
+    timer_middle :: reference(),
+    last_notify_cseq :: nksip:cseq()
 }).
 
 
@@ -200,11 +170,11 @@
 %% - {nksip_min_se, MinSE}
 
 -record(dialog, {
-    id :: nksip_dialog:id(),
-    app_id :: nksip:app_id(),
+    id :: nksip_dialog_lib:id(),
+    srv_id :: nkservice:service_id(),
     call_id :: nksip:call_id(),
-    created :: nksip_lib:timestamp(),
-    updated :: nksip_lib:timestamp(),
+    created :: nklib_util:timestamp(),
+    updated :: nklib_util:timestamp(),
     local_seq :: 0 | nksip:cseq(),
     remote_seq :: 0 | nksip:cseq(),
     local_uri :: nksip:uri(),
@@ -217,47 +187,11 @@
     secure :: boolean(),
     caller_tag :: nksip:tag(),
     invite :: nksip:invite(),
-    subscriptions = [] :: [nksip:subscription()],
+    subscriptions = [] :: [#subscription{}],
     supported = [] :: [nksip:token()],
-    allowed = [] :: [nksip:method()],
-    meta = [] :: nksip_lib:optslist()
+    meta = [] :: nksip:optslist()
 }).
 
-
--record(invite, {
-    status :: nksip_dialog:invite_status(),
-    answered :: nksip_lib:timestamp(),
-    class :: uac | uas | proxy,
-    request :: nksip:request(),
-    response :: nksip:response(),
-    ack :: nksip:request(),
-    local_sdp :: nksip_sdp:sdp(),
-    remote_sdp :: nksip_sdp:sdp(),
-    media_started :: boolean(),
-    sdp_offer :: nksip_call_dialog:sdp_offer(),
-    sdp_answer :: nksip_call_dialog:sdp_offer(),
-    timeout_timer :: reference(),
-    retrans_timer :: reference(),
-    next_retrans :: integer(),
-    session_expires :: integer(),
-    refresh_timer :: reference(),
-    meta = [] :: nksip_lib:optslist()   % No current use
-}).
-
-
--record(subscription, {
-    id :: nksip_subscription:id(),
-    event :: nksip:token(),
-    expires :: pos_integer(),
-    status :: nksip_subscription:status(),
-    class :: uac | uas,
-    answered :: nksip_lib:timestamp(),
-    timer_n :: reference(),
-    timer_expire :: reference(),
-    timer_middle :: reference(),
-    last_notify_cseq :: nksip:cseq(),
-    meta = [] :: nksip_lib:optslist()   % No current use
-}).
 
 
 -record(sdp_m, {
@@ -294,30 +228,6 @@
 }).
 
 
--record(reg_contact, {
-    index :: nksip_registrar:index(),
-    contact :: nksip:uri(), 
-    updated :: nksip_lib:l_timestamp(),
-    expire :: nksip_lib:timestamp(),
-    q :: float(),  
-    call_id :: nksip:call_id(),
-    cseq :: nksip:cseq(),
-    transport :: nksip_transport:transport(),
-    path :: [nksip:uri()],
-    instance_id :: binary(),
-    reg_id :: binary(),
-    min_tmp_pos :: integer(),
-    next_tmp_pos :: integer(),
-    meta = [] :: nksip_lib:optslist()  % No current use
-}).
-
-
--record(reg_publish, {
-    data :: nksip:body(),
-    meta = [] :: nksip_lib:optslist()   % No current use
-}).
-
-
 -endif.
 
 
@@ -340,13 +250,13 @@
     erlang:put(debug_timer, tl(erlang:get(debug_timer)))).
 -endif.
 
--ifndef(P).
--define(P(S,P), io:format(S++"\n", P)).
--define(P(S), ?P(S, [])).
--endif.
+% -ifndef(P).
+% -define(P(S,P), io:format(S++"\n", P)).
+% -define(P(S), ?P(S, [])).
+% -endif.
 
--ifndef(I).
--define(I(S,P), lager:info(S++"\n", P)).
--define(I(S), ?I(S, [])).
--endif.
+% -ifndef(I).
+% -define(I(S,P), lager:info(S++"\n", P)).
+% -define(I(S), ?I(S, [])).
+% -endif.
 

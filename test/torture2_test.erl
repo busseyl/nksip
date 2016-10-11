@@ -21,6 +21,8 @@
 %% -------------------------------------------------------------------
 
 -module(torture2_test).
+-include_lib("nklib/include/nklib.hrl").
+-include_lib("nkpacket/include/nkpacket.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 -include("../include/nksip.hrl").
@@ -59,9 +61,9 @@ torture2_test_() ->
 start() ->
     tests_util:start_nksip(),
 
-    {ok, _} = nksip:start(server1, ?MODULE, server1, [
-        {transports, [{udp, all, 5060}]},
-        no_100
+    ok = tests_util:start(server1, ?MODULE, [
+        {sip_no_100, true},
+        {transports, "sip:all:5060"}
     ]),
     timer:sleep(100),
     tests_util:log(),
@@ -348,7 +350,7 @@ invalid_12() ->
         "m=video 3227 RTP/AVP 31\r\n"
         "a=rtpmap:31 LPC\r\n">>,
     #sipmsg{headers=[{<<"date">>, Date}]} = parse(Msg),
-    error = nksip_parse:dates(Date),
+    error = nklib_parse:dates(Date),
     ok.
 
 
@@ -480,7 +482,7 @@ invalid_19() ->
 
 
 parse(Msg) ->
-    case nksip_parse:packet(test, #transport{proto=udp}, Msg) of
+    case nksip_parse:packet(test, #nkport{transp=udp}, Msg) of
         {ok, SipMsg, <<>>} -> SipMsg;
         {ok, SipMsg, Tail} -> {tail, SipMsg, Tail};
         {error, Error} -> {error, Error}
@@ -506,14 +508,12 @@ send(tcp, Msg) ->
 %%%%%%%%%%%%%%%%%%%%%%%  CallBacks %%%%%%%%%%%%%%%%%%%%%
 
 
-init(Id) ->
-    {ok, Id}.
-
-route(_ReqId, Scheme, _User, _Domain, _From, server1=State)
-      when Scheme=/=sip, Scheme=/=sips ->
-    {reply, unsupported_uri_scheme, State};
-
-route(_, _, _, _, _, State) ->
-    {reply, process, State}.
+route(Scheme, _User, _Domain, Req, _Call) ->
+    case nksip_request:srv_name(Req) of
+        {ok, server1} when Scheme=/=sip, Scheme=/=sips ->
+            {reply, unsupported_uri_scheme};
+        {ok, _} ->
+            process
+    end.
 
 

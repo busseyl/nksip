@@ -41,18 +41,20 @@ update_test_() ->
 start() ->
     tests_util:start_nksip(),
 
-    {ok, _} = nksip:start(client1, ?MODULE, client1, [
-        {from, "sip:client1@nksip"},
-        {local_host, "localhost"},
-        {transports, [{udp, all, 5060}, {tls, all, 5061}]},
-        no_100
+    ok = tests_util:start(client1, ?MODULE, [
+        {sip_from, "sip:client1@nksip"},
+        {sip_local_host, "localhost"},
+        {sip_no_100, true},
+        {transports, "sip:all:5060, <sip:all:5061;transport=tls>"},
+        {plugins, [nksip_100rel]}
     ]),
     
-    {ok, _} = nksip:start(client2, ?MODULE, client2, [
-        {from, "sip:client2@nksip"},
-        {local_host, "127.0.0.1"},
-        {transports, [{udp, all, 5070}, {tls, all, 5071}]},
-        no_100
+    ok = tests_util:start(client2, ?MODULE, [
+        {sip_from, "sip:client2@nksip"},
+        {sip_local_host, "127.0.0.1"},
+        {sip_no_100, true},
+        {transports, ["<sip:all:5070>", "<sip:all:5071;transport=tls>"]},
+        {plugins, [nksip_100rel]}
     ]),
 
     tests_util:log(),
@@ -80,10 +82,11 @@ basic() ->
     
     CB = {callback, fun(Reply) ->
         case Reply of
-            {ok, 180, [{dialog_id, FunD1}]} ->
+            {resp, 180, Resp1, _Call} ->
                 % Both sessions have been stablished
+                {ok, FunD1} = nksip_dialog:get_handle(Resp1),
                 spawn(fun() ->
-                    FunD2 = nksip_dialog:remote_id(FunD1, client2),
+                    FunD2 = nksip_dialog_lib:remote_id(FunD1, client2),
                     SDP1 = SDP0#sdp{vsn=Vsn0+1}, 
                     {SDP1,SDP0} = get_sessions(C2, FunD2),
                     SDP2 = SDP0#sdp{vsn=Vsn0+2},
@@ -103,7 +106,7 @@ basic() ->
         {add, "x-nk-reply", base64:encode(erlang:term_to_binary({Ref, Self}))}
     ],
     {ok, 200, Values1} = nksip_uac:invite(C1, SipC2, [CB, Body | Hds1]),
-    [{dialog_id, DialogId}] = Values1,
+    [{dialog, DialogId}] = Values1,
     ok = nksip_uac:ack(DialogId, []),
     ok = tests_util:wait(Ref, [
                                 {client2, sdp_start}, 
@@ -116,24 +119,24 @@ basic() ->
                             ]),
     SDP4 = SDP0#sdp{vsn=Vsn0+4},
     SDP5 = SDP0#sdp{vsn=Vsn0+5},
-    DialogId2 = nksip_dialog:remote_id(DialogId, client2),
+    DialogId2 = nksip_dialog_lib:remote_id(DialogId, client2),
     {SDP4,SDP5} = get_sessions(C2, DialogId2),
 
-    [
-        {local_target, <<"<sip:a@127.0.0.1>">>},
-        {remote_target, <<"<sip:b@127.0.0.1:5070>">>},
+    {ok, [
+        {raw_local_target, <<"<sip:a@127.0.0.1>">>},
+        {raw_remote_target, <<"<sip:b@127.0.0.1:5070>">>},
         {invite_local_sdp, SDP5},
         {invite_remote_sdp, SDP4} 
-    ] = nksip_dialog:fields(DialogId, 
-                    [local_target, remote_target, invite_local_sdp, invite_remote_sdp]),
-    [
-        {local_target, <<"<sip:b@127.0.0.1:5070>">>},
-        {remote_target, <<"<sip:a@127.0.0.1>">>},        
+    ]} = nksip_dialog:metas([raw_local_target, raw_remote_target, 
+                            invite_local_sdp, invite_remote_sdp], DialogId),
+    {ok, [
+        {raw_local_target, <<"<sip:b@127.0.0.1:5070>">>},
+        {raw_remote_target, <<"<sip:a@127.0.0.1>">>},        
         {invite_local_sdp, SDP4},
         {invite_remote_sdp, SDP5} 
-    ] = 
-        nksip_dialog:fields(DialogId2, 
-            [local_target, remote_target, invite_local_sdp, invite_remote_sdp]),
+    ]} = 
+        nksip_dialog:metas([raw_local_target, raw_remote_target, 
+                            invite_local_sdp, invite_remote_sdp], DialogId2),
 
     {ok, 200, []} = nksip_uac:bye(DialogId, []),
     ok.
@@ -149,7 +152,8 @@ pending() ->
 
     CB = {callback, fun(Reply) ->
         case Reply of
-            {ok, 180, [{dialog_id, FunD1}]} ->
+            {resp, 180, Resp1, _Call} ->
+                {ok, FunD1} = nksip_dialog:get_handle(Resp1),
                 % We have an offer, but no answer
                 spawn(fun() ->
                     SDP1 = SDP0#sdp{vsn=Vsn0+1}, 
@@ -159,76 +163,73 @@ pending() ->
         end
     end},    Body = {body, SDP0},
     Hd1 = {add, "x-nk-op", "pending1"},
-    {ok, 200, [{dialog_id, DialogId}]} = nksip_uac:invite(C1, SipC2, [Hd1, Body, CB]),
+    {ok, 200, [{dialog, DialogId}]} = nksip_uac:invite(C1, SipC2, [Hd1, Body, CB]),
     ok = nksip_uac:ack(DialogId, []),
 
     ok = tests_util:wait(Ref, [fun_ok_1]),
-    {ok, 200, []} = nksip_uac:bye(DialogId, []).
+    {ok, 200, []} = nksip_uac:bye(DialogId, []),
+    ok.
 
 
 
 %%%%%%%%%%%%%%%%%%%%%%%  CallBacks (servers and clients) %%%%%%%%%%%%%%%%%%%%%
 
-
-init(Id) ->
-    {ok, Id}.
-
-
-invite(ReqId, Meta, From, AppId=State) ->
-    tests_util:save_ref(AppId, ReqId, Meta),
-    Op = case nksip_request:header(ReqId, <<"x-nk-op">>) of
-        [Op0] -> Op0;
-        _ -> <<"decline">>
+sip_invite(Req, _Call) ->
+    tests_util:save_ref(Req),
+    Op = case nksip_request:header(<<"x-nk-op">>, Req) of
+        {ok, [Op0]} -> Op0;
+        {ok, _} -> <<"decline">>
     end,
+    {ok, Body} = nksip_request:body(Req),
+    {ok, ReqId} = nksip_request:get_handle(Req),
     proc_lib:spawn(
         fun() ->
             case Op of
                 <<"basic">> ->
-                    Body = nksip_lib:get_value(body, Meta),
                     SDP1 = nksip_sdp:increment(Body),
-                    ok = nksip_request:reply(ReqId, {rel_ringing, SDP1}),
+                    ok = nksip_request:reply({rel_ringing, SDP1}, ReqId),
                     timer:sleep(500),
-                    nksip:reply(From, ok);
+                    nksip_request:reply(ok, ReqId);
                 <<"pending1">> ->
-                    ok = nksip_request:reply(ReqId, ringing), 
+                    ok = nksip_request:reply(ringing, ReqId), 
                     timer:sleep(100),
-                    nksip:reply(From, ok);
+                    nksip_request:reply(ok, ReqId);
                 _ ->
-                    nksip:reply(From, decline)
+                    nksip_request:reply(decline, ReqId)
             end
         end),
-    {noreply, State}.
+    noreply.
 
 
-ack(_ReqId, Meta, _From, AppId=State) ->
-    tests_util:send_ref(AppId, Meta, ack),
-    {reply, ok, State}.
+sip_ack(Req, _Call) ->
+    tests_util:send_ref(ack, Req),
+    ok.
 
 
-update(_ReqId, Meta, _From, AppId=State) ->
-    tests_util:send_ref(AppId, Meta, update),
-    Body = case nksip_lib:get_value(body, Meta) of
-        #sdp{} = SDP -> nksip_sdp:increment(SDP);
-        _ -> <<>>
+sip_update(Req, _Call) ->
+    tests_util:send_ref(update, Req),
+    Body = case nksip_request:body(Req) of
+        {ok, #sdp{} = SDP} -> nksip_sdp:increment(SDP);
+        {ok, _} -> <<>>
     end,        
-    {reply, {answer, Body}, State}.
+    {reply, {answer, Body}}.
 
 
-dialog_update(DialogId, Update, AppId=State) ->
-    tests_util:dialog_update(DialogId, Update, AppId),
-    {noreply, State}.
+sip_dialog_update(Update, Dialog, _Call) ->
+    tests_util:dialog_update(Update, Dialog),
+    ok.
 
 
-session_update(DialogId, Update, AppId=State) ->
-    tests_util:session_update(DialogId, Update, AppId),
-    {noreply, State}.
+sip_session_update(Update, Dialog, _Call) ->
+    tests_util:session_update(Update, Dialog),
+    ok.
 
 
 
 %%%%%%%%%%%%%%%%%%%%%%%  Util %%%%%%%%%%%%%%%%%%%%%
 
-get_sessions(AppId, DialogId) ->
-    {ok, Sessions} = nksip:get(AppId, sessions, []),
+get_sessions(SrvId, DialogId) ->
+    Sessions = nkservice_server:get(SrvId, sessions, []),
     case lists:keyfind(DialogId, 1, Sessions) of
         {_DialogId, Local, Remote} -> {Local, Remote};
         _ -> not_found

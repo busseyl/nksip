@@ -2,8 +2,10 @@
 
 ## v0.4
 
-* Documentation improvement.
+* ~~Documentation improvement~~.
+* ~~Extraction of non-core functionality into plugins~~.
 * ~~**Powerful plugin mechanism**~~.
+* ~~New UAS API~~
 * ~~Reliable provisional responses~~.
 * ~~UPDATE and MESSAGE methods~~.
 * ~~Full event support (SUBSCRIBE/NOTIFY)~~.
@@ -22,22 +24,22 @@
 * ~~Bug corrections~~.
 
 
-## v0.5
+## v0.5 (next version from master)
 
-* Extraction of non-SIP functionality into a new Erlang project, NkCore
+* ~~Test in R17~~
+* ~~Extraction of non-SIP functionality into a new Erlang project, NkCore~~ (they have been extracted into three projects: [NkLIB](https://github.com/Nekso/nklib), [NkPACKET](https://github.com/Nekso/nkpacket) and [NkSERVICE](https://github.com/Nekso/nkservice).
 
 
-## v0.6
+## v0.6 (next version from development)
 
-* Socket external control (to be able to use NkSIP without having to use Erlang or outside of the NkSIP Erlang VM).
-* node.js integration
+* Maps everywhere
+* External control (to be able to use NkSIP without having to use Erlang or outside of the NkSIP Erlang VM).
+* Heavy testing
 
 
 ## No date
 
-* Javascript, Python, Ruby, Lua, Java libraries. Elixir DSL?
 * _Bridge_ support for B2BUA.
-* Fully distributed, highly available version based on [Riak Core](https://github.com/basho/riak_core).
 * IMS and RCS extensions.
 * More application examples.
 * Better statistics support.
@@ -52,6 +54,16 @@
 * [RFC4321](http://tools.ietf.org/html/rfc4321): Invite recomendations
 * [RFC4488](http://tools.ietf.org/html/rfc4488): REFER without subscription
 * [RFC4538](http://tools.ietf.org/html/rfc4538): Dialog authorization
+
+
+# Other features
+
+The future distributed and highly available features of NkSIP will be developed in a new, much more ambitious project, [NetComposer.io](http://www.slideshare.net/carlosjgf/net-composer-v2).
+
+Please contact carlosj.gf@gmail.com for details.
+
+
+
 
 
 

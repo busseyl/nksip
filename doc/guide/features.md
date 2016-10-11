@@ -1,26 +1,28 @@
 # Features
 
 ## NkSIP main features are:
-* Full support for all curently defined SIP methods: INVITE, ACK, REGISTER, OPTIONS, INFO, UPDATE, PRACK, SUBSCRIBE, NOTIFY, REFER, PUBLISH and MESSAGE, as UAC, UAS and Proxy.
-* Can be used to develop any possible SIP application: endpoints, stateful proxies with serial and parallel forking, stateless proxies, B2BUAs, application servers, registrars, SBCs, load generators, etc. 
-* UDP, TCP, TLS, SCTP, WS and WSS transports, capable of handling thousands of simultaneous sessions.
+* Full support for all curently defined SIP methods: INVITE, ACK, REGISTER, OPTIONS, INFO, UPDATE, PRACK, SUBSCRIBE, NOTIFY, REFER, PUBLISH and MESSAGE, as an UAC, an UAS or and Proxy.
+* Can be used to very easily develop any possible SIP application: endpoints, stateful proxies with serial and parallel forking, stateless proxies, B2BUAs, application servers, registrars, SBCs, load generators, etc. 
+* Transports UDP, TCP, TLS, SCTP, WS and WSS (websockets) are available, all of them capable of handling thousands of simultaneous sessions.
 * Full SIP Event support.
 * A written from scratch, fully typed 100% Erlang code with few external dependencies.
 * Robust and highly scalable, using all available processor cores automatically.
 * More than 150 tests covering nearly all of the functionality.
-* Sophisticated plugin mechanism, that adds zero overhead to the core.
+* Sophisticated plugin mechanism, that adds very low overhead to the core.
 * Hot, on-the-fly core and application configuration and code upgrades.
 * IPv6 support and IPv4 <-> IPv6 bridge.
 * Full support for NAPTR and SRV location, including priority and weights.
-* Dialog and SDP media start and stop detection.
+* Dialog and SDP processing utility functions, including media start and stop detection.
 
 ## Included standard plugins:
-* SIP Digest Authentication.
-* SIP Registrar.
-* SIP Event State Compositor.
+* Digest Authentication.
+* Registrar Server and Automatic Registrations.
+* Event State Compositor.
 * Reliable provisional responses.
-* Automatic registrations and timed pings.
-* Outbound and GRUU support.
+* Session Timers
+* SIP REFER.
+* Outbound and GRUU.
+* Trace and Statistics.
 
 ## Implemented RFCs
 In the current version the following RFCs are fully implemented (see notes):

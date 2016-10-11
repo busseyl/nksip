@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -21,27 +21,29 @@
 -module(nksip_pbx).
 -author('Carlos Gonzalez <carlosj.gf@gmail.com>').
 
--export([start/0, stop/0, trace/1, loglevel/1]).
+-export([start/0, stop/0]).
+-export([check_speed/1, get_speed/0, trace/1, loglevel/1]).
 
 %% ===================================================================
 %% Start & Stop
 %% ===================================================================
 
 
-%% @doc Starts the SipApp.
--spec start() -> ok.
-
+%% @doc Starts a new Service, listening on port 5060 for udp and tcp and 5061 for tls,
+%% and acting as a registrar.
 start() ->
-    nksip_pbx_sipapp:start(),
-    loglevel(notice),
-    trace(false).
+    {ok, _} = nksip:start(pbx, #{
+        callback => ?MODULE,
+        plugins => [nksip_registrar, nksip_100rel, nksip_gruu,
+                    nksip_outbound, nksip_timers],
+        transports => "<sip:all:5060>, <sip:all:5061;transport=tls>"
+    }),
+    ok.
 
 
-%% @doc Stops the SipApp.
--spec stop() -> ok.
-
+%% @doc Stops the Service.
 stop() ->
-    nksip_pbx_sipapp:stop().
+    nksip:stop(pbx).
 
 
 
@@ -49,15 +51,32 @@ stop() ->
 %% Utilities
 %% ===================================================================
 
+%% @doc Stops or restart automatic response time detection.
+check_speed(Bool) ->
+    nkservice_server:cast(pbx, {check_speed, Bool}).
+
+
+%% @doc Get all registered endpoints with their last respnse time.
+get_speed() ->
+    nkservice_server:call(pbx, get_speed).
+
+
 %% @doc Enables SIP trace messages to console.
 -spec trace(Start::boolean()) -> ok.
 
-trace(true) ->  nksip_trace:start();
-trace(false) -> nksip_trace:stop().
+trace(true) ->  
+	nksip_trace:start();
+trace(false) -> 
+	nksip_trace:stop().
 
 
 %% @doc Changes console log level.
 %% Availanle options are `debug' (maximum), `info' (medium) and `notice' (minimum).
 -spec loglevel(debug|info|notice) -> ok.
 
-loglevel(Level) -> lager:set_loglevel(lager_console_backend, Level).
+loglevel(Level) -> 
+	nklib_log:console_loglevel(Level),
+	ok = nksip:update(pbx, [{log_level, Level}]).
+
+
+

@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -26,65 +26,72 @@
 
 -export([launch/0, trace/1, loglevel/1]).
 
+
 %% @doc Launches the full tutorial.
 launch() ->
-    ok = nksip:start(server, nksip_tutorial_sipapp_server, [server], 
-        [
-            registrar, 
-            {transport, {udp, any, 5060}}, 
-            {transport, {tls, any, 5061}}
-         ]),
-    ok = nksip:start(client1, nksip_tutorial_sipapp_client, [client1], 
-        [
-            {from, "sip:client1@nksip"},
-            {transport, {udp, {127,0,0,1}, 5070}}, 
-            {transport, {tls, {127,0,0,1}, 5071}}
-        ]),
-    ok = nksip:start(client2, nksip_tutorial_sipapp_client, [client2], 
-        [   {from, "sips:client2@nksip"},
-            {transport, {udp, {127,0,0,1}, 5080}}, 
-            {transport, {tls, {127,0,0,1}, 5081}}
-        ]),
+    {ok, _} = nksip:start(server, #{
+        sip_local_host => "localhost",
+        callback => nksip_tutorial_server_callbacks,
+        plugins => [nksip_registrar],
+        transports => "sip:all:5060, <sip:all:5061;transport=tls>"
+    }),
+    {ok, _} = nksip:start(client1, #{
+        sip_local_host => "localhost",
+        sip_from => "sip:client1@nksip",
+        callback => nksip_tutorial_client_callbacks,
+        plugins => [nksip_uac_auto_auth],
+        transports => "sip:127.0.0.1:5070, sips:127.0.0.1:5071"
+    }),
+    {ok, _} = nksip:start(client2, #{
+        sip_local_host => "localhost",
+        sip_from => "sips:client2@nksip",
+        callback => nksip_tutorial_client_callbacks,
+        plugins => [nksip_uac_auto_auth],
+        transports => "sip:all, sips:all"
+    }),
+
+    nksip_registrar_util:clear(),
+
 
     {ok,200,[]} = nksip_uac:options(client2, "sip:127.0.0.1:5070", []),
     {ok,407,[{reason_phrase, <<"Proxy Authentication Required">>}]} =
         nksip_uac:options(client1, "sip:127.0.0.1", [{meta,[reason_phrase]}]),
 
-    {ok,200,[]} = nksip_uac:options(client1, "sip:127.0.0.1", [{pass, "1234"}]),
-    {ok,200,[]} = nksip_uac:options(client2, "<sip:127.0.0.1;transport=tls>", [{pass, "1234"}]),
+    {ok,200,[]} = nksip_uac:options(client1, "sip:127.0.0.1", [{sip_pass, "1234"}]),
+    {ok,200,[]} = nksip_uac:options(client2, "<sip:127.0.0.1;transport=tls>", [{sip_pass, "1234"}]),
 
-    {ok,200,[{<<"contact">>, [<<"<sip:client1@127.0.0.1:5070>;expires=3600">>]}]} = 
+    {ok,200,[{<<"contact">>, [<<"<sip:client1@localhost:5070>", _/binary>>]}]} = 
         nksip_uac:register(client1, "sip:127.0.0.1", 
-                           [{pass, "1234"}, contact, {meta, [<<"contact">>]}]),
+                           [{sip_pass, "1234"}, contact, {meta, [<<"contact">>]}]),
 
-    {ok,200,[]} = nksip_uac:register(client2, "sips:127.0.0.1", [{pass, "1234"}, contact]),
+    {ok,200,[]} = nksip_uac:register(client2, "sips:127.0.0.1", [{sip_pass, "1234"}, contact]),
 
     {ok,200,[{all_headers, _}]} = 
-        nksip_uac:register(client2, "sips:127.0.0.1", [{pass, "1234"}, {meta, [all_headers]}]),
+        nksip_uac:register(client2, "sips:127.0.0.1", [{sip_pass, "1234"}, {meta, [all_headers]}]),
 
     {ok,200,[]} = nksip_uac:options(client1, "sip:127.0.0.1", []),
     {ok,200,[]} = nksip_uac:options(client2, "sips:127.0.0.1", []),
 
     {ok,407,[]} = nksip_uac:options(client1, "sips:client2@nksip", [{route, "<sip:127.0.0.1;lr>"}]),
-    {ok,200,[{<<"nksip-id">>, [<<"client2">>]}]} = 
+    {ok,200,[{<<"x-nk-id">>, [<<"client2">>]}]} = 
         nksip_uac:options(client1, "sips:client2@nksip", 
-                          [{route, "<sip:127.0.0.1;lr>"}, {pass, "1234"},
-                           {meta, [<<"nksip-id">>]}]),
+                          [{route, "<sip:127.0.0.1;lr>"}, {sip_pass, "1234"},
+                           {meta, [<<"x-nk-id">>]}]),
 
-    {ok,488,[{dialog_id, _}]} = 
+    {ok,488,[]} = 
         nksip_uac:invite(client2, "sip:client1@nksip", [{route, "<sips:127.0.0.1;lr>"}]),
 
-    {ok,200,[{dialog_id, DlgId}]}= 
+    {ok,200,[{dialog, DlgId}]}= 
         nksip_uac:invite(client2, "sip:client1@nksip", 
-                        [{route, "<sips:127.0.0.1;lr>"}, {body, nksip_sdp:new()}]),
-    ok = nksip_uac:ack(DlgId, []),
+                        [{route, "<sips:127.0.0.1;lr>"}, {body, nksip_sdp:new()},
+                          auto_2xx_ack]),
 
-    confirmed = nksip_dialog:field(client2, DlgId, status),
+    {ok, confirmed} = nksip_dialog:meta(invite_status, DlgId),
     [_, _, _] = nksip_dialog:get_all_data(),
+    timer:sleep(1000),
 
     {ok,200,[]} = nksip_uac:bye(DlgId, []),
     ok = nksip:stop_all().
-
 
 
 %% ===================================================================
@@ -92,14 +99,28 @@ launch() ->
 %% ===================================================================
 
 %% @doc Enables SIP trace messages to console.
--spec trace(Start::boolean()) -> ok.
+-spec trace(Start::boolean()) -> 
+    ok.
 
-trace(true) ->  nksip_trace:start();
-trace(false) -> nksip_trace:stop().
+trace(true) ->  
+    nksip_trace:start(),
+    ok;
+trace(false) -> 
+    nksip_trace:stop(),
+    ok.
 
 
 %% @doc Changes console log level.
 %% Availanle options are `debug' (maximum), `info' (medium) and `notice' (minimum).
--spec loglevel(debug|info|notice) -> ok.
+-spec loglevel(debug|info|notice) -> 
+    ok.
 
-loglevel(Level) -> lager:set_loglevel(lager_console_backend, Level).
+loglevel(Level) -> 
+    nklib_log:console_loglevel(Level),
+    ok = nksip:update(server, [{log_level, Level}]),
+    ok = nksip:update(client1, [{log_level, Level}]),
+    ok = nksip:update(client2, [{log_level, Level}]),
+    ok.
+
+
+

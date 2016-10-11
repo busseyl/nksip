@@ -36,20 +36,21 @@ uac_test_() ->
             {timeout, 60, fun uac/0},
             {timeout, 60, fun info/0},
             {timeout, 60, fun message/0},
-            {timeout, 60, fun timeout/0}
+            {timeout, 60, fun timeout/0},
+            {timeout, 60, fun bye_with_reason/0}
         ]
     }.
 
 
 start() ->
     tests_util:start_nksip(),
-    {ok, _} = nksip:start(client1, ?MODULE, client1, [
-        {from, "\"NkSIP Basic SUITE Test Client\" <sip:client1@nksip>"},
-        {transports, [ {udp, all, 5070},{tls, all, 5071}]}
+    ok = tests_util:start(client1, ?MODULE, [
+        {sip_from, "\"NkSIP Basic SUITE Test Client\" <sip:client1@nksip>"},
+        {transports, "sip:all:5070, <sip:all:5071;transport=tls>"}
     ]),
             
-    {ok, _} = nksip:start(client2, ?MODULE, client2, [
-        {from, "\"NkSIP Basic SUITE Test Client\" <sip:client2@nksip>"}]),
+    ok = tests_util:start(client2, ?MODULE, [
+        {sip_from, "\"NkSIP Basic SUITE Test Client\" <sip:client2@nksip>"}]),
     tests_util:log(),
     ?debugFmt("Starting ~p", [?MODULE]).
 
@@ -67,17 +68,28 @@ uac() ->
     {error, {invalid, <<"to">>}} = nksip_uac:options(client2, SipC1, [{to, "<>"}]),
     {error, {invalid, <<"route">>}} = nksip_uac:options(client2, SipC1, [{route, "<>"}]),
     {error, {invalid, <<"contact">>}} = nksip_uac:options(client2, SipC1, [{contact, "<>"}]),
-    {error, {invalid, cseq_num}} = nksip_uac:options(client2, SipC1, [{cseq_num, -1}]),
-    lager:error("Next error about 'unknown_siapp' is expected"),
-    {error, sipapp_not_found} = nksip_uac:options(none, SipC1, []),
-    lager:error("Next error about 'too_many_calls' is expected"),
-    nksip_counters:incr(nksip_calls, 1000000000),
+    {error, {invalid_config, cseq_num}} = nksip_uac:options(client2, SipC1, [{cseq_num, -1}]),
+    % lager:error("Next error about 'unknown_sipapp' is expected"),
+    {error, service_not_found} = nksip_uac:options(none, SipC1, []),
+    lager:error("Next 2 errors about 'too_many_calls' are expected"),
+    nklib_counters:incr(nksip_calls, 1000000000),
     {error, too_many_calls} = nksip_uac:options(client2, SipC1, []),
-    nksip_counters:incr(nksip_calls, -1000000000),
+    nklib_counters:incr(nksip_calls, -1000000000),
+    {ok, Client2Id} = nkservice_server:get_srv_id(client2),
+    nklib_counters:incr({nksip_calls, Client2Id}, 1000000000),
+    {error, too_many_calls} = nksip_uac:options(client2, SipC1, []),
+    nklib_counters:incr({nksip_calls, Client2Id}, -1000000000),
 
     Self = self(),
     Ref = make_ref(),
-    Fun = fun(Reply) -> Self ! {Ref, Reply} end,
+    Fun = fun(Reply) -> 
+        case Reply of
+            {req, Req, _Call} -> Self ! {Ref, {req, Req}};
+            {resp, Code, Resp, _Call} -> Self ! {Ref, {resp, Code, Resp}};
+            {error, Error} -> Self ! {Ref, {error, Error}}
+        end
+    end,
+
     CB = {callback, Fun},
     Hds = [{add, "x-nk-op", busy}, {add, "x-nk-prov", "true"}],
 
@@ -94,78 +106,63 @@ uac() ->
     end,
 
     % Sync
-    {ok, 200, Values2} = nksip_uac:options(client2, SipC1, [{meta, [app_name, id, call_id]}]),
-    [{app_name, client2}, {id, RespId2}, {call_id, CallId2}] = Values2,
-    CallId2 = nksip_response:call_id(RespId2),
-    error = nksip_dialog:field(RespId2, status),
-    {error, unknown_dialog} = nksip_uac:options(RespId2, []),
-
-    % Sync, get_response
-    {resp, #sipmsg{class={resp, _, _}}} = nksip_uac:options(client2, SipC1, [get_response]),
+    {ok, 200, Values2} = nksip_uac:options(client2, SipC1, [{meta, [srv_name, handle, call_id]}]),
+    [{srv_name, client2}, {handle, RespId2}, {call_id, CallId2}] = Values2,
+    {ok, CallId2} = nksip_response:call_id(RespId2),
+    {error, _} = nksip_dialog:meta(status, RespId2),
+    {error, invalid_dialog} = nksip_uac:options(RespId2, []),
 
     % Sync, callback for request
-    {ok, 200, [{id, RespId3}]} = 
-        nksip_uac:options(client2, SipC1, [CB, get_request, {meta, [id]}]),
-    CallId3 = nksip_response:call_id(RespId3),
+    {ok, 200, [{handle, RespId3}]} = 
+        nksip_uac:options(client2, SipC1, [CB, get_request, {meta, [handle]}]),
+    {ok, CallId3} = nksip_response:call_id(RespId3),
     receive 
         {Ref, {req, #sipmsg{class={req, _}, call_id=CallId3}}} -> ok
         after 500 -> error(uac) 
     end,
 
     % Sync, callback for request and provisional response
-    {ok, 486, [{call_id, CallId4}, {id, RespId4}]} = 
-        nksip_uac:invite(client2, SipC1, [CB, get_request, {meta, [call_id, id]}|Hds]),
+    {ok, 486, [{call_id, CallId4}, {handle, RespId4}]} = 
+        nksip_uac:invite(client2, SipC1, [CB, get_request, {meta, [call_id, handle]}|Hds]),
 
-    lager:notice("RESPID4: ~p", [RespId4]),
+    % lager:notice("RESPID4: ~p", [RespId4]),
 
 
-    CallId4 = nksip_response:call_id(RespId4),
-    % DlgId4 = nksip_dialog:get_id(RespId4),
+    {ok, CallId4} = nksip_response:call_id(RespId4),
+    % {ok, DlgId4} = nksip_dialog:get_handle(RespId4),
     receive 
         {Ref, {req, Req4}} -> 
-            CallId4 = nksip_sipmsg:field(Req4, call_id)
+            {ok, CallId4} = nksip_request:call_id(Req4)
         after 500 -> 
             error(uac) 
     end,
     receive 
-        {Ref, {ok, 180, Values4}} ->
-            [{dialog_id, DlgId4}, {call_id, CallId4}, {id, RespId4_180}] = Values4,
-            CallId4 = nksip_response:call_id(RespId4_180),
-            CallId4 = nksip_dialog:call_id(DlgId4)
-        after 500 -> 
-            error(uac) 
-    end,
-
-    % Sync, callback for request and provisional response, get_request, get_response
-    {resp, #sipmsg{class={resp, 486, _}, call_id=CallId5}} = 
-        nksip_uac:invite(client2, SipC1, [CB, get_request, get_response|Hds]),
-    receive 
-        {Ref, {req, #sipmsg{class={req, _}, call_id=CallId5}}} -> ok
-        after 500 -> error(uac) 
-    end,
-    receive 
-        {Ref, {resp, #sipmsg{class={resp, 180, _}, call_id=CallId5}}} -> ok
+        {Ref, {resp, 180, Resp4}} ->
+            {ok, [{dialog_handle, DlgId4}, {call_id, CallId4}, {handle, RespId4_180}]} =
+                nksip_response:metas([dialog_handle, call_id, handle], Resp4),
+            {ok, CallId4} = nksip_response:call_id(RespId4_180),
+            {ok, CallId4} = nksip_dialog:call_id(DlgId4)
         after 500 -> 
             error(uac) 
     end,
 
     % Async
     {async, ReqId6} = nksip_uac:invite(client2, SipC1, [async, CB, get_request | Hds]),
-    CallId6 = nksip_request:call_id(ReqId6),
-    CallId6 = nksip_request:field(ReqId6, call_id),
+    {ok, CallId6} = nksip_request:call_id(ReqId6),
+    {ok, CallId6} = nksip_request:meta(call_id, ReqId6),
     receive 
         {Ref, {req, Req6}} -> 
-            ReqId6 = nksip_sipmsg:field(Req6, id),
-            CallId6 = nksip_sipmsg:field(Req6, call_id)
+            {ok, ReqId6} = nksip_request:get_handle(Req6),
+            {ok, CallId6} = nksip_request:call_id(Req6)
         after 500 -> 
             error(uac) 
     end,
     receive 
-        {Ref, {ok, 180, [{dialog_id, _}]}} -> ok
+        {Ref, {resp, 180, _}} -> ok
         after 500 -> error(uac) 
     end,
     receive 
-        {Ref, {ok, 486, []}} -> ok
+        {Ref, {resp, 486, _}} -> ok
         after 500 -> error(uac) 
     end,
     ok.
@@ -175,10 +172,10 @@ uac() ->
 info() ->
     SipC1 = "sip:127.0.0.1:5070",
     Hd1 = {add, <<"x-nk-op">>, <<"ok">>},
-    {ok, 200, [{dialog_id, DialogId2}]} = nksip_uac:invite(client2, SipC1, [Hd1]),
+    {ok, 200, [{dialog, DialogId2}]} = nksip_uac:invite(client2, SipC1, [Hd1]),
     ok = nksip_uac:ack(DialogId2, []),
     Fs = {meta, [<<"x-nk-method">>, <<"x-nk-dialog">>]},
-    DialogId1 = nksip_dialog:remote_id(DialogId2, client1),
+    DialogId1 = nksip_dialog_lib:remote_id(DialogId2, client1),
 
     {ok, 200, Values1} = nksip_uac:info(DialogId2, [Fs]),
     [{<<"x-nk-method">>, [<<"info">>]}, {<<"x-nk-dialog">>, [DialogId1]}] = Values1,
@@ -194,7 +191,7 @@ info() ->
 
 timeout() ->
     SipC1 = "sip:127.0.0.1:5070",
-    {ok, _} = nksip:update(client2, [{timer_t1, 10}, {timer_c, 1}]),
+    ok = nksip:update(client2, [{sip_timer_t1, 10}, {sip_timer_c, 1}]),
 
     lager:notice("Next notices about several timeouts are expected"),
 
@@ -219,7 +216,7 @@ timeout() ->
         <<"Timer C Timeout">> -> ok;
         <<"Timer B Timeout">> -> ok
     end,
-    nksip_call_router:clear_all_calls(),
+    nksip_call:clear_all(),
     ok.
 
 
@@ -232,38 +229,52 @@ message() ->
     receive 
         {Ref, {ok, 10, RawDate, <<"text/plain">>, <<"Message">>}} ->
             Date = httpd_util:convert_request_date(binary_to_list(RawDate)),
-            true = nksip_lib:timestamp() - nksip_lib:gmt_to_timestamp(Date) < 2
-        after 1000 -> error(message)
+            true = nklib_util:timestamp() - nklib_util:gmt_to_timestamp(Date) < 2
+        after 1000 -> 
+            error(message)
     end,
     ok.
 
+
+bye_with_reason() ->
+    SipC1 = "sip:127.0.0.1:5070",
+    Hd1 = {add, <<"x-nk-op">>, <<"ok">>},
+    {ok, 200, [{dialog, DialogId2}]} = nksip_uac:invite(client2, SipC1, [Hd1]),
+    ok = nksip_uac:ack(DialogId2, []),
+    Fs = {meta, [<<"x-nk-method">>, <<"x-nk-dialog">>]},
+    DialogId1 = nksip_dialog_lib:remote_id(DialogId2, client1),
+
+    {ok, 200, Values1} = nksip_uac:info(DialogId2, [Fs]),
+    [{<<"x-nk-method">>, [<<"info">>]}, {<<"x-nk-dialog">>, [DialogId1]}] = Values1,
+
+    %% send a BYE with custom reason header
+    {ok, 200, []} = nksip_uac:bye(DialogId2, [{reason, <<"custom reason">>}]),
+    ok.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%  CallBacks (servers and clients) %%%%%%%%%%%%%%%%%%%%%
 
 
-init(Id) ->
-    {ok, Id}.
-
-
-invite(ReqId, Meta, From, AppId=State) ->
-    tests_util:save_ref(AppId, ReqId, Meta),
-    Op = case nksip_request:header(ReqId, <<"x-nk-op">>) of
-        [Op0] -> Op0;
-        _ -> <<"decline">>
+sip_invite(Req, _Call) ->
+    tests_util:save_ref(Req),
+    Op = case nksip_request:header(<<"x-nk-op">>, Req) of
+        {ok, [Op0]} -> Op0;
+        {ok, _} -> <<"decline">>
     end,
-    Sleep = case nksip_request:header(ReqId, <<"x-nk-sleep">>) of
-        [Sleep0] -> nksip_lib:to_integer(Sleep0);
-        _ -> 0
+    Sleep = case nksip_request:header(<<"x-nk-sleep">>, Req) of
+        {ok, [Sleep0]} -> nklib_util:to_integer(Sleep0);
+        {ok, _} -> 0
     end,
-    Prov = case nksip_request:header(ReqId, <<"x-nk-prov">>) of
-        [<<"true">>] -> true;
-        _ -> false
+    Prov = case nksip_request:header(<<"x-nk-prov">>, Req) of
+        {ok, [<<"true">>]} -> true;
+        {ok, _} -> false
     end,
+    {ok, ReqId} = nksip_request:get_handle(Req),
+    {ok, DialogId} = nksip_dialog:get_handle(Req),
     proc_lib:spawn(
         fun() ->
             if 
-                Prov -> nksip_request:reply(ReqId, ringing); 
+                Prov -> nksip_request:reply(ringing, ReqId); 
                 true -> ok 
             end,
             case Sleep of
@@ -272,56 +283,59 @@ invite(ReqId, Meta, From, AppId=State) ->
             end,
             case Op of
                 <<"ok">> ->
-                    nksip:reply(From, {ok, []});
+                    nksip_request:reply({ok, []}, ReqId);
                 <<"answer">> ->
                     SDP = nksip_sdp:new("client2", 
                                             [{"test", 4321, [{rtpmap, 0, "codec1"}]}]),
-                    nksip:reply(From, {ok, [{body, SDP}]});
+                    nksip_request:reply({ok, [{body, SDP}]}, ReqId);
                 <<"busy">> ->
-                    nksip:reply(From, busy);
+                    nksip_request:reply(busy, ReqId);
                 <<"increment">> ->
-                    DialogId = nksip_lib:get_value(dialog_id, Meta),
-                    SDP1 = nksip_dialog:field(DialogId, invite_local_sdp),
+                    {ok, SDP1} = nksip_dialog:meta(invite_local_sdp, DialogId),
                     SDP2 = nksip_sdp:increment(SDP1),
-                    nksip:reply(From, {ok, [{body, SDP2}]});
+                    nksip_request:reply({ok, [{body, SDP2}]}, ReqId);
                 _ ->
-                    nksip:reply(From, decline)
+                    nksip_request:reply(decline, ReqId)
             end
         end),
-    {noreply, State}.
+    noreply.
 
 
-options(ReqId, _Meta, _From, State) ->
-    case nksip_request:header(ReqId, <<"x-nk-sleep">>) of
-        [Sleep0] -> 
-            nksip_request:reply(ReqId, 101), 
-            timer:sleep(nksip_lib:to_integer(Sleep0));
-        _ -> 
-            ok
-    end,
-    {reply, {ok, [contact]}, State}.
+sip_options(Req, _Call) ->
+    case nksip_request:header(<<"x-nk-sleep">>, Req) of
+        {ok, [Sleep0]} -> 
+            {ok, ReqId} = nksip_request:get_handle(Req),
+            spawn(
+                fun() ->
+                    nksip_request:reply(101, ReqId), 
+                    timer:sleep(nklib_util:to_integer(Sleep0)),
+                    nksip_request:reply({ok, [contact]}, ReqId)
+                end),
+            noreply; 
+        {ok, _} -> 
+            {reply, {ok, [contact]}}
+    end.
 
 
-info(ReqId, _Meta, _From, State) ->
-    DialogId = nksip_request:dialog_id(ReqId),
-    {reply, {ok, [{add, "x-nk-method", "info"}, {add, "x-nk-dialog", DialogId}]}, State}.
+sip_info(Req, _Call) ->
+    {ok, DialogId} = nksip_dialog:get_handle(Req),
+    {reply, {ok, [{add, "x-nk-method", "info"}, {add, "x-nk-dialog", DialogId}]}}.
 
 
-message(ReqId, _Meta, _From, State) ->
-    case nksip_request:header(ReqId, <<"x-nk-reply">>) of
-        [RepBin] ->
+sip_message(Req, _Call) ->
+    case nksip_request:header(<<"x-nk-reply">>, Req) of
+        {ok, [RepBin]} ->
             {Ref, Pid} = erlang:binary_to_term(base64:decode(RepBin)),
-            [
+            {ok, [
                 {_, Expires},
                 {_, [Date]},
-                {_, ContentType},
+                {_, [ContentType]},
                 {_, Body}
 
-            ] = nksip_request:fields(ReqId, 
-                    [parsed_expires, <<"date">>, content_type, body]),
+            ]} = nksip_request:metas([expires, <<"date">>, <<"content-type">>, body], Req),
             Pid ! {Ref, {ok, Expires, Date, ContentType, Body}},
-            {reply, ok, State};
-        _ ->
-            {reply, decline, State}
+            {reply, ok};
+        {ok, _} ->
+            {reply, decline}
     end.
 

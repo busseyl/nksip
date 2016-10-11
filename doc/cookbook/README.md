@@ -1,4 +1,6 @@
-# Cookbook
+# Welcome to NkSIP Documentation
+
+## Cookbook
 
 ### Generic
 
@@ -6,7 +8,7 @@
 * Managing authentication
 * Replying to a request
 
-### SipApps
+### Services
 
 * Stateless proxy server
 * Stateful proxy server

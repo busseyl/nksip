@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -23,9 +23,10 @@
 -module(nksip_auth).
 -author('Carlos Gonzalez <carlosj.gf@gmail.com>').
 
--export([get_authentication/2, realms/1, make_ha1/3]).
--export([make_request/3, make_response/2]).
+-export([authorize_data/2, realms/1, make_ha1/3]).
+-export([make_request/3, make_response/2, get_authentication/2]).
 
+-include_lib("nklib/include/nklib.hrl").
 -include("nksip.hrl").
 -include("nksip_call.hrl").
 
@@ -43,7 +44,7 @@
 
 %% @doc Extracts all the realms present in <i>WWW-Authenticate</i> or
 %% <i>Proxy-Authenticate</i> headers from a response.
--spec realms(nksip:response()|nksip:id()) ->
+-spec realms(nksip:response()|nksip:handle()) ->
     [Realm::binary()].
 
 realms(#sipmsg{headers=Headers}) ->
@@ -51,11 +52,11 @@ realms(#sipmsg{headers=Headers}) ->
 
 realms(RespId) ->
     Hd1 = case nksip_response:header(RespId, ?RESP_WWW) of
-        WWW when is_list(WWW) -> [{?RESP_WWW, Data} || Data <- WWW];
+        {ok, WWW} when is_list(WWW) -> [{?RESP_WWW, Data} || Data <- WWW];
         _ -> []
     end,
     Hd2 = case nksip_response:header(RespId, ?RESP_PROXY) of
-        Proxy when is_list(Proxy) -> [{?RESP_PROXY, Data} || Data <- Proxy];
+        {ok, Proxy} when is_list(Proxy) -> [{?RESP_PROXY, Data} || Data <- Proxy];
         _ -> []
     end,
     get_realms(Hd1++Hd2, []).
@@ -67,7 +68,7 @@ get_realms([{Name, Value}|Rest], Acc) ->
         Name==?RESP_WWW; Name==?RESP_PROXY ->
             case parse_header(Value) of
                 {error, _} -> get_realms(Rest, Acc);
-                AuthData -> get_realms(Rest, [nksip_lib:get_value(realm, AuthData)|Acc])
+                AuthData -> get_realms(Rest, [nklib_util:get_value(realm, AuthData)|Acc])
             end;
         true ->
             get_realms(Rest, Acc)
@@ -85,67 +86,36 @@ get_realms([], Acc) ->
 
 make_ha1(User, Pass, Realm) ->
     % <<"HA1!">> is a custom header to be detected as a ha1 hash
-    <<"HA1!", (crypto:hash(md5, list_to_binary([User, $:, Realm, $:, Pass])))/binary>>.
-
-
-%% @doc Extracts digest authentication information from a incoming request.
-%% The response can include:
-%% <ul>
-%%    <li>`{{digest, Realm}, true}': there is at least one valid user authenticated
-%%        with this `Realm'.</li>
-%%    <li>`{{digest, Realm}, false}': there is at least one user offering 
-%%        an authentication header for this `Realm', but all of them have
-%%        failed the authentication.</li>
-%% </ul>
-%%
-%% `Fun' will be called when a password for a pair user, realm is needed.
-%% It can return `true' (accepts the request with any password), `false' 
-%% (doesn't accept the request) or a `binary()' pasword or hash.
-%%
--spec get_authentication(nksip:request(), function()) -> 
-    [Authorized] 
-    when Authorized :: {{digest, Realm::binary()}, true|false}.
-
-get_authentication(Req, PassFun) ->
-    Fun = fun({Ok, _User, Realm}, Acc) ->
-        case lists:keyfind(Realm, 1, Acc) of
-            false when Ok -> [{Realm, true}|Acc];
-            false -> [{Realm, false}|Acc];
-            {Realm, true} -> Acc;
-            {Realm, false} when Ok -> nksip_lib:store_value(Realm, true, Acc);
-            {Realm, false} -> Acc
-        end
-    end,
-    [{{digest, Realm}, Ok} || 
-        {Realm, Ok} <- lists:foldl(Fun, [], check_digest(Req, PassFun))].
+    <<"HA1!", (md5(list_to_binary([User, $:, Realm, $:, Pass])))/binary>>.
 
 
 %% @doc Adds an <i>Authorization</i> or <i>Proxy-Authorization</i> header 
 %% for a request after receiving a 401 or 407 response.
 %% CSeq must be updated after calling this function.
 %%
-%% Recognized options are `pass', `user', `cnonce' and `nc'.
--spec make_request(Req::nksip:request(), Resp::nksip:response(), nksip_lib:optslist()) ->
+%% Recognized options are `sip_pass', `user', `cnonce' and `nc'.
+-spec make_request(Req::nksip:request(), Resp::nksip:response(), nksip:optslist()) ->
     {ok, nksip:request()} | {error, Error}
     when Error :: invalid_auth_header | unknown_nonce | no_pass.
 
 make_request(Req, #sipmsg{headers=RespHeaders}, Opts) ->
     #sipmsg{
         class = {req, Method},
+        % srv_id = SrvId,
         ruri = RUri, 
         from = {#uri{user=User}, _},
         headers = ReqHeaders
     } = Req,
     try
-        ReqAuthHeaders = nksip_lib:extract(ReqHeaders, [?REQ_WWW, ?REQ_PROXY]),
+        ReqAuthHeaders = nklib_util:extract(ReqHeaders, [?REQ_WWW, ?REQ_PROXY]),
         ReqNOnces = [
             case parse_header(ReqAuthHeader) of
                 {error, _} -> throw(invalid_auth_header);
-                ParsedReqHeader -> nksip_lib:get_value(nonce, ParsedReqHeader)
+                ParsedReqHeader -> nklib_util:get_value(nonce, ParsedReqHeader)
             end 
             || {_, ReqAuthHeader} <- ReqAuthHeaders
         ],
-        RespAuthHeaders = nksip_lib:extract(RespHeaders, [?RESP_WWW, ?RESP_PROXY]),
+        RespAuthHeaders = nklib_util:extract(RespHeaders, [?RESP_WWW, ?RESP_PROXY]),
         case RespAuthHeaders of
             [{RespName, RespData}] -> ok;
             _ -> RespName = RespData = throw(invalid_auth_header)
@@ -154,24 +124,24 @@ make_request(Req, #sipmsg{headers=RespHeaders}, Opts) ->
             {error, _} -> AuthHeaderData = throw(invalid_auth_header);
             AuthHeaderData -> ok
         end,
-        RespNOnce = nksip_lib:get_value(nonce, AuthHeaderData),
+        RespNOnce = nklib_util:get_value(nonce, AuthHeaderData),
         case lists:member(RespNOnce, ReqNOnces) of
             true -> throw(unknown_nonce);
             false -> ok
         end,
-        case get_passes(Opts, []) of
-            [] -> 
-                Opts1 = throw(no_pass);
+        case nklib_util:get_value(sip_pass, Opts) of
+            undefined -> 
+                ReqOpts = throw(no_pass);
             Passes ->
-                Opts1 = [
+                ReqOpts = [
                     {method, Method}, 
                     {ruri, RUri}, 
-                    {user, nksip_lib:get_binary(user, Opts, User)}, 
-                    {passes, Passes} 
+                    {user, nklib_util:get_binary(user, Opts, User)}, 
+                    {sip_pass, Passes} 
                     | Opts
                 ]
         end,
-        case make_auth_request(AuthHeaderData, Opts1) of
+        case make_auth_request(AuthHeaderData, ReqOpts) of
             error -> 
                 throw(invalid_auth_header);
             {ok, ReqData} ->
@@ -199,21 +169,49 @@ make_request(Req, #sipmsg{headers=RespHeaders}, Opts) ->
 
 make_response(Realm, Req) ->
     #sipmsg{
-        app_id = AppId, 
+        srv_id = SrvId, 
         call_id = CallId,
-        transport=#transport{remote_ip=Ip, remote_port=Port}
+        nkport = NkPort
     } = Req,
-    Nonce = nksip_lib:luid(),
-    Config = nksip_sipapp_srv:config(AppId),
-    Timeout = nksip_lib:get_value(nonce_timeout, Config),
-    put_nonce(AppId, CallId, Nonce, {Ip, Port}, Timeout),
-    Opaque = nksip_lib:hash(AppId),
+    {ok, {_, _, Ip, Port}} = nkpacket:get_remote(NkPort),
+    Nonce = nklib_util:luid(),
+    Timeout = SrvId:cache_sip_nonce_timeout(),
+    put_nonce(SrvId, CallId, Nonce, {Ip, Port}, Timeout),
+    Opaque = nklib_util:hash(SrvId),
     list_to_binary([
         "Digest realm=\"", Realm, "\", nonce=\"", Nonce, "\", "
         "algorithm=MD5, qop=\"auth\", opaque=\"", Opaque, "\""
     ]).
 
 
+%% @doc Extracts digest authentication information from a incoming request.
+%% The response can include:
+%% <ul>
+%%    <li>`{{digest, Realm}, true}': there is at least one valid user authenticated
+%%        with this `Realm'.</li>
+%%    <li>`{{digest, Realm}, invalid}': there is at least one user offering
+%%        an invalid authentication header for this `Realm'</li>
+%%    <li>`{{digest, Realm}, false}': there is at least one user offering 
+%%        an authentication header for this `Realm', but all of them have
+%%        failed the authentication.</li>
+%% </ul>
+%%
+-spec authorize_data(nksip:request(), nksip_call:call()) ->
+    [Authorized] 
+    when Authorized :: {{digest, Realm::binary()}, true|invalid|false}.
+
+authorize_data(Req, #call{srv_id=SrvId}=Call) ->
+    PassFun = fun(User, Realm) ->
+        Args = [User, Realm, Req, Call],
+        case SrvId:nks_sip_call(sip_get_user_pass, Args, SrvId) of
+            {ok, Reply} -> ok;
+            error -> Reply = false
+        end,
+        ?call_debug("UAS calling get_user_pass(~p, ~p, Req, Call): ~p", 
+                    [User, Realm, Reply]),
+        Reply
+    end,
+    get_authentication(Req, PassFun).
 
 
 %% ===================================================================
@@ -221,10 +219,34 @@ make_response(Realm, Req) ->
 %% ===================================================================
 
 
+%% @private Extracts digest authentication information from a incoming request.
+%% `Fun' will be called when a password for a pair user, realm is needed.
+%% It can return `true' (accepts the request with any password), `false' 
+%% (doesn't accept the request) or a `binary()' pasword or hash.
+%%
+-spec get_authentication(nksip:request(), function()) -> 
+    [Authorized] 
+    when Authorized :: {{digest, Realm::binary()}, true|invalid|false}.
+
+get_authentication(Req, PassFun) ->
+    Fun = fun({Res, _User, Realm}, Acc) ->
+        case lists:keyfind(Realm, 1, Acc) of
+            false -> [{Realm, Res}|Acc];
+            {Realm, true} -> Acc;
+            {Realm, _} when Res == true -> nklib_util:store_value(Realm, Res, Acc);
+            {Realm, invalid} -> Acc;
+            {Realm, _} when Res == invalid -> nklib_util:store_value(Realm, Res, Acc);
+            {Realm, false} -> Acc
+        end
+    end,
+    [{{digest, Realm}, Res} || 
+        {Realm, Res} <- lists:foldl(Fun, [], check_digest(Req, PassFun))].
+
+
 %% @private Finds auth headers in request, and for each one extracts user and 
 %% realm, calling `get_user_pass/3' callback to check if it is correct.
 -spec check_digest(Req::nksip:request(), function()) ->
-    [{boolean(), User::binary(), Realm::binary()}].
+    [{true | invalid | false, User::binary(), Realm::binary()}].
 
 check_digest(#sipmsg{headers=Headers}=Req, Fun) ->
     check_digest(Headers, Req, Fun, []).
@@ -240,22 +262,15 @@ check_digest([{Name, Data}|Rest], Req, Fun, Acc)
         {error, _} ->
             check_digest(Rest, Req, Fun, Acc);
         AuthData ->
-            Resp = nksip_lib:get_value(response, AuthData),
-            User = nksip_lib:get_binary(username, AuthData),
-            Realm = nksip_lib:get_binary(realm, AuthData),
+            Resp = nklib_util:get_value(response, AuthData),
+            User = nklib_util:get_binary(username, AuthData),
+            Realm = nklib_util:get_binary(realm, AuthData),
             Result = case Fun(User, Realm) of
                 true -> true;
                 false -> false;
                 Pass -> check_auth_header(AuthData, Resp, User, Realm, Pass, Req)
             end,
-            case Result of
-                true ->
-                    check_digest(Rest, Req, Fun, [{true, User, Realm}|Acc]);
-                false ->
-                    check_digest(Rest, Req, Fun, [{false, User, Realm}|Acc]);
-                not_found ->
-                    check_digest(Rest, Req, Fun, Acc)
-            end
+            check_digest(Rest, Req, Fun, [{Result, User, Realm}|Acc])
     end;
     
 check_digest([_|Rest], Req, Fun, Acc) ->
@@ -263,29 +278,33 @@ check_digest([_|Rest], Req, Fun, Acc) ->
 
 
 %% @private Generates a Authorization or Proxy-Authorization header
--spec make_auth_request(nksip_lib:optslist(), nksip_lib:optslist()) ->
+-spec make_auth_request(nksip:optslist(), nksip:optslist()) ->
     {ok, binary()} | error.
 
 make_auth_request(AuthHeaderData, UserOpts) ->
-    QOP = nksip_lib:get_value(qop, AuthHeaderData, []),
-    Algorithm = nksip_lib:get_value(algorithm, AuthHeaderData, 'MD5'),
+    QOP = nklib_util:get_value(qop, AuthHeaderData, []),
+    Algorithm = nklib_util:get_value(algorithm, AuthHeaderData, 'MD5'),
     case Algorithm=='MD5' andalso (QOP==[] orelse lists:member(auth, QOP)) of
         true ->
-            case nksip_lib:get_binary(cnonce, UserOpts) of
-                <<>> -> CNonce = nksip_lib:luid();
+            case nklib_util:get_binary(cnonce, UserOpts) of
+                <<>> -> CNonce = nklib_util:luid();
                 CNonce -> ok
             end,
-            Nonce = nksip_lib:get_binary(nonce, AuthHeaderData, <<>>),  
-            Nc = nksip_lib:msg("~8.16.0B", [nksip_lib:get_integer(nc, UserOpts, 1)]),
-            Realm = nksip_lib:get_binary(realm, AuthHeaderData, <<>>),
-            Passes = nksip_lib:get_value(passes, UserOpts, []),
-            User = nksip_lib:get_binary(user, UserOpts),
-            case get_pass(Passes, Realm, <<>>) of
-                <<"HA1!", HA1/binary>> -> _Pass = <<"hash">>;
-                _Pass -> <<"HA1!", HA1/binary>> = make_ha1(User, _Pass, Realm)
+            Nonce = nklib_util:get_binary(nonce, AuthHeaderData, <<>>),  
+            Nc = nklib_util:msg("~8.16.0B", [nklib_util:get_integer(nc, UserOpts, 1)]),
+            Realm = nklib_util:get_binary(realm, AuthHeaderData, <<>>),
+            Passes = nklib_util:get_value(sip_pass, UserOpts, []),
+            Pass = case nklib_util:get_value(Realm, Passes) of
+                undefined -> nklib_util:get_value(<<>>, Passes, <<>>);
+                RealmPass -> RealmPass
             end,
-            Uri = nksip_unparse:uri(nksip_lib:get_value(ruri, UserOpts)),
-            Method1 = case nksip_lib:get_value(method, UserOpts) of
+            User = nklib_util:get_binary(user, UserOpts),
+            case Pass of
+                <<"HA1!", HA1/binary>> -> ok; %_Pass = <<"hash">>;
+                _ -> <<"HA1!", HA1/binary>> = make_ha1(User, Pass, Realm)
+            end,
+            Uri = nklib_unparse:uri3(nklib_util:get_value(ruri, UserOpts)),
+            Method1 = case nklib_util:get_value(method, UserOpts) of
                 'ACK' -> 'INVITE';
                 Method -> Method
             end,
@@ -301,7 +320,7 @@ make_auth_request(AuthHeaderData, UserOpts) ->
                     [] -> [];
                     _ -> [", qop=auth, cnonce=\"", CNonce, "\", nc=", Nc]
                 end,
-                case nksip_lib:get_value(opaque, AuthHeaderData) of
+                case nklib_util:get_value(opaque, AuthHeaderData) of
                     undefined -> [];
                     Opaque -> [", opaque=\"", Opaque, "\""]
                 end
@@ -313,43 +332,45 @@ make_auth_request(AuthHeaderData, UserOpts) ->
 
 
 %% @private
--spec check_auth_header(nksip_lib:optslist(), binary(), binary(), binary(), 
+-spec check_auth_header(nksip:optslist(), binary(), binary(), binary(), 
                             binary(), nksip:request()) -> 
-    true | false | not_found.
+    true | invalid | false.
 
 check_auth_header(AuthHeader, Resp, User, Realm, Pass, Req) ->
     #sipmsg{
         class = {req, Method},
-        app_id = AppId,
+        srv_id = SrvId,
         call_id = CallId,
-        transport = #transport{remote_ip=Ip, remote_port=Port}
+        nkport = NkPort
     } = Req,
+    {ok, {_, _, Ip, Port}} = nkpacket:get_remote(NkPort),
     case
-        nksip_lib:get_value(scheme, AuthHeader) /= digest orelse
-        nksip_lib:get_value(qop, AuthHeader) /= [auth] orelse
-        nksip_lib:get_value(algorithm, AuthHeader, 'MD5') /= 'MD5'
+        nklib_util:get_value(scheme, AuthHeader) /= digest orelse
+        nklib_util:get_value(qop, AuthHeader) /= [auth] orelse
+        nklib_util:get_value(algorithm, AuthHeader, 'MD5') /= 'MD5'
     of
         true ->
-            ?call_notice("received invalid parameters in Authorization Header: ~p", 
-                        [AuthHeader]),
-            not_found;
+            ?notice(SrvId, CallId, 
+                    "received invalid parameters in Authorization Header: ~p", 
+                    [AuthHeader]),
+            invalid;
         false ->
             % Should we check the uri in the authdata matches the ruri of the request?
-            Uri = nksip_lib:get_value(uri, AuthHeader),
-            Nonce = nksip_lib:get_value(nonce, AuthHeader),
-            Found = get_nonce(AppId, CallId, Nonce),
+            Uri = nklib_util:get_value(uri, AuthHeader),
+            Nonce = nklib_util:get_value(nonce, AuthHeader),
+            Found = get_nonce(SrvId, CallId, Nonce),
             if
                 Found==not_found ->
-                    Opaque = nksip_lib:get_value(opaque, AuthHeader),
-                    case nksip_lib:hash(AppId) of
+                    Opaque = nklib_util:get_value(opaque, AuthHeader),
+                    case nklib_util:hash(SrvId) of
                         Opaque -> ?call_notice("received invalid nonce", []);
                         _ -> ok
                     end,
-                    not_found;
+                    invalid;
                 Method=='ACK' orelse Found=={Ip, Port} ->
-                    CNonce = nksip_lib:get_value(cnonce, AuthHeader),
-                    Nc = nksip_lib:get_value(nc, AuthHeader),
-                    case nksip_lib:to_binary(Pass) of
+                    CNonce = nklib_util:get_value(cnonce, AuthHeader),
+                    Nc = nklib_util:get_value(nc, AuthHeader),
+                    case nklib_util:to_binary(Pass) of
                         <<"HA1!", HA1/binary>> -> ok;
                         _ -> <<"HA1!", HA1/binary>> = make_ha1(User, Pass, Realm)
                     end,
@@ -376,34 +397,34 @@ check_auth_header(AuthHeader, Resp, User, Realm, Pass, Req) ->
 %% Internal
 %% ===================================================================
 
-%% @private
-get_passes([], Acc) ->
-    lists:reverse(Acc);
+% %% @private
+% get_passes([], Acc) ->
+%     lists:reverse(Acc);
 
-get_passes([Opt|Rest], Acc) ->
-    Acc1 = case Opt of
-        {passes, PassList} -> PassList++Acc;
-        {pass, {P, R}} -> [{nksip_lib:to_binary(P), nksip_lib:to_binary(R)}|Acc];
-        {pass, P} -> [{nksip_lib:to_binary(P), <<>>}|Acc];
-        _ -> Acc
-    end,
-    get_passes(Rest, Acc1).
+% get_passes([Opt|Rest], Acc) ->
+%     Acc1 = case Opt of
+%         {passes, PassList} -> PassList++Acc;
+%         {pass, {P, R}} -> [{nklib_util:to_binary(P), nklib_util:to_binary(R)}|Acc];
+%         {pass, P} -> [{nklib_util:to_binary(P), <<>>}|Acc];
+%         _ -> Acc
+%     end,
+%     get_passes(Rest, Acc1).
 
 %% @private Generates a standard SIP Digest Response
 -spec make_auth_response([atom()], nksip:method(), binary(), binary(), 
                             binary(), binary(), binary()) -> binary().
 
 make_auth_response(QOP, Method, BinUri, HA1bin, Nonce, CNonce, Nc) ->
-    HA1 = nksip_lib:hex(HA1bin),
-    HA2_base = <<(nksip_lib:to_binary(Method))/binary, ":", BinUri/binary>>,
-    HA2 = nksip_lib:hex(crypto:hash(md5, HA2_base)),
+    HA1 = nklib_util:hex(HA1bin),
+    HA2_base = <<(nklib_util:to_binary(Method))/binary, ":", BinUri/binary>>,
+    HA2 = nklib_util:hex(md5(HA2_base)),
     case QOP of
         [] ->
-            nksip_lib:hex(crypto:hash(md5, list_to_binary([HA1, $:, Nonce, $:, HA2])));
+            nklib_util:hex(md5(list_to_binary([HA1, $:, Nonce, $:, HA2])));
         _ ->    
             case lists:member(auth, QOP) of
                 true ->
-                    nksip_lib:hex(crypto:hash(md5, list_to_binary(
+                    nklib_util:hex(md5(list_to_binary(
                         [HA1, $:, Nonce, $:, Nc, $:, CNonce, ":auth:", HA2])));
                 _ ->
                     <<>>
@@ -411,28 +432,42 @@ make_auth_response(QOP, Method, BinUri, HA1bin, Nonce, CNonce, Nc) ->
     end.
 
 
-%% @private Extracts password from user options.
-%% The first matching realm is used, otherwise first password without realm
--spec get_pass([{binary(), binary()}], binary(), binary()) ->   Pass::binary().
-get_pass([], _Realm, FirstPass) -> FirstPass;
-get_pass([{FirstPass, <<>>}|Rest], Realm, <<>>) -> get_pass(Rest, Realm, FirstPass);
-get_pass([{Pass, Realm}|_], Realm, _FirstPass) -> Pass;
-get_pass([_|Rest], Realm, FirstPass) -> get_pass(Rest, Realm, FirstPass).
+%% @private
+-ifdef(old_crypto_hash).
+md5(Term) -> crypto:md5(Term).
+-else.
+md5(Term) -> crypto:hash(md5, Term).
+-endif.
+
+
+% %% @private Extracts password from user options.
+% %% The first matching realm is used, otherwise first password without realm
+% -spec get_pass([{binary(), binary()}], binary(), binary()) -> 
+%     Pass::binary().
+
+% get_pass([], _Realm, FirstPass) -> 
+%     FirstPass;
+% get_pass([{<<>>, FirstPass}|Rest], Realm, <<>>) -> 
+%     get_pass(Rest, Realm, FirstPass);
+% get_pass([{Realm, Pass}|_], Realm, _FirstPass) -> 
+%     Pass;
+% get_pass([_|Rest], Realm, FirstPass) -> 
+%     get_pass(Rest, Realm, FirstPass).
 
 
 %% @private
-get_nonce(AppId, CallId, Nonce) ->
-    nksip_store:get({nksip_auth_nonce, AppId, CallId, Nonce}).
+get_nonce(SrvId, CallId, Nonce) ->
+    nklib_store:get({nksip_auth_nonce, SrvId, CallId, Nonce}).
 
 %% @private
-put_nonce(AppId, CallId, Nonce, Term, Timeout) ->
-    nksip_store:put({nksip_auth_nonce, AppId, CallId, Nonce}, Term,
+put_nonce(SrvId, CallId, Nonce, Term, Timeout) ->
+    nklib_store:put({nksip_auth_nonce, SrvId, CallId, Nonce}, Term,
                     [{ttl, Timeout}]).
 
 
 %% @private
 -spec parse_header(string() | binary()) ->
-    nksip_lib:optslist() | {error, term()}.
+    nksip:optslist() | {error, term()}.
 
 parse_header(Bin) when is_binary(Bin) ->
     parse_header(binary_to_list(Bin));

@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -25,6 +25,8 @@
 -export([route/4, response_stateless/2]).
 -export([normalize_uriset/1]).
 
+-include_lib("nklib/include/nklib.hrl").
+-include_lib("nkpacket/include/nkpacket.hrl").
 -include("nksip.hrl").
 -include("nksip_call.hrl").
 
@@ -34,73 +36,75 @@
 %% ===================================================================
 
 %% @doc Tries to route a request to set of uris, serially and/or in parallel.
--spec route(nksip_call:trans(), nksip:uri_set(), nksip_lib:optslist(), nksip_call:call()) -> 
-    {fork, nksip_call:trans(), nksip:uri_set()} | stateless_proxy | 
+-spec route(nksip:uri_set(), nksip:optslist(), nksip_call:trans(), nksip_call:call()) -> 
+    {fork, nksip_call:trans(), nksip:uri_set()} | noreply | 
     {reply, nksip:sipreply(), nksip_call:call()}.
 
-route(UAS, UriList, ProxyOpts, Call) ->
+route(UriList, ProxyOpts, UAS, Call) ->
     try
+        #call{srv_id=SrvId} = Call,
         UriSet = case normalize_uriset(UriList) of
             [[]] -> throw({reply, temporarily_unavailable});
             UriSet0 -> UriSet0
         end,
         % lager:warning("URISET: ~p", [UriList]),
-        #trans{request=Req, method=Method} = UAS,
-        Req1 = check_request(Req, ProxyOpts),
-        {Req2, Call1} = case nksip_call_timer:uas_check_422(Req1, Call) of
-            continue -> {Req1, Call};
-            {reply, ReplyTimer, CallTimer} -> throw({reply, ReplyTimer, CallTimer});
-            {update, ReqTimer, CallTimer} -> {ReqTimer, CallTimer}
+        #trans{method=Method} = UAS,
+        case SrvId:nks_sip_route(UriSet, ProxyOpts, UAS, Call) of
+            {continue, [UriSet1, ProxyOpts1, UAS1, Call1]} ->
+                ok;
+            {reply, Reply, Call1} ->
+                UriSet1=ProxyOpts1=UAS1=throw({reply, Reply, Call1})
         end,
-        Stateless = lists:member(stateless, ProxyOpts),
+        Req1 = check_request(UAS1#trans.request, ProxyOpts1),
+        Stateless = lists:member(stateless, ProxyOpts1),
         case Method of
             'ACK' when Stateless ->
-                [[First|_]|_] = UriSet,
-                route_stateless(Req2, First, ProxyOpts, Call1);
+                [[First|_]|_] = UriSet1,
+                route_stateless(Req1, First, ProxyOpts1, Call1);
             'ACK' ->
-                {fork, UAS#trans{request=Req2}, UriSet, ProxyOpts};
+                {fork, UAS1#trans{request=Req1}, UriSet1, ProxyOpts1};
             _ ->
-                case nksip_sipmsg:header(Req, <<"proxy-require">>, tokens) of
+                case nksip_sipmsg:header(<<"proxy-require">>, Req1, tokens) of
                     [] -> 
                         ok;
                     PR ->
-                        Text = nksip_lib:bjoin([T || {T, _} <- PR]),
+                        Text = nklib_util:bjoin([T || {T, _} <- PR]),
                         throw({reply, {bad_extension, Text}})
                 end,
                 case Stateless of
                     true -> 
-                        [[First|_]|_] = UriSet,
-                        route_stateless(Req2, First, ProxyOpts, Call1);
+                        [[First|_]|_] = UriSet1,
+                        route_stateless(Req1, First, ProxyOpts1, Call1);
                     false ->
-                        {fork, UAS#trans{request=Req2}, UriSet, ProxyOpts}
+                        {fork, UAS1#trans{request=Req1}, UriSet1, ProxyOpts1}
                 end
         end
     catch
-        throw:{reply, Reply} -> {reply, Reply, Call};
-        throw:{reply, Reply, TCall} -> {reply, Reply, TCall}
+        throw:{reply, TReply} -> {reply, TReply, Call};
+        throw:{reply, TReply, TCall} -> {reply, TReply, TCall}
     end.
 
 
 %% @private
--spec route_stateless(nksip:request(), nksip:uri(), nksip_lib:optslist(), nksip_call:call()) -> 
-    stateless_proxy.
+-spec route_stateless(nksip:request(), nksip:uri(), nksip:optslist(), nksip_call:call()) -> 
+    noreply.
 
 route_stateless(Req, Uri, ProxyOpts, _Call) ->
     #sipmsg{class={req, Method}} = Req,
     Req1 = Req#sipmsg{ruri=Uri},
-    case nksip_uac_lib:proxy_make(Req1, ProxyOpts) of
-        {ok, Req2, ProxyOpts1} ->
-            SendOpts = [stateless_via | ProxyOpts1],
-            case nksip_transport_uac:send_request(Req2, SendOpts) of
+    case nksip_call_uac_make:proxy_make(Req1, ProxyOpts) of
+        {ok, Req2, ProxyOpts2} ->
+            SendOpts = [stateless_via | ProxyOpts2],
+            case nksip_call_uac_transp:send_request(Req2, SendOpts) of
                 {ok, _} ->  
                     ?call_debug("Stateless proxy routing ~p to ~s", 
-                                [Method, nksip_unparse:uri(Uri)]);
+                                [Method, nklib_unparse:uri(Uri)]);
                 {error, Error} -> 
                     ?call_notice("Stateless proxy could not route ~p to ~s: ~p",
-                                 [Method, nksip_unparse:uri(Uri), Error])
+                                 [Method, nklib_unparse:uri(Uri), Error])
             end,
-           stateless_proxy;
-        {error, {reply, Reply}} ->
+           noreply;
+        {reply, Reply} ->
             throw({reply, Reply});
         {error, Error} ->
             ?call_warning("Error procesing proxy opts: ~p, ~p: ~p", 
@@ -116,20 +120,25 @@ route_stateless(Req, Uri, ProxyOpts, _Call) ->
 response_stateless(#sipmsg{class={resp, Code, _}}, Call) when Code < 101 ->
     Call;
 
-response_stateless(#sipmsg{vias=[_, Via|RestVias], transport=Transp}=Resp, Call) ->
+response_stateless(#sipmsg{vias=[_, Via|RestVias], nkport=NkPort}=Resp, Call) ->
     #sipmsg{cseq={_, Method}, class={resp, Code, _}} = Resp,
-    #via{proto=ViaProto, port=ViaPort, opts=ViaOpts} = Via,
-    {ok, RIp} = nksip_lib:to_ip(nksip_lib:get_value(<<"received">>, ViaOpts)),
-    RPort = case nksip_lib:get_integer(<<"rport">>, ViaOpts) of
+    #via{transp=ViaTransp, port=ViaPort, opts=ViaOpts} = Via,
+    {ok, RIp} = nklib_util:to_ip(nklib_util:get_value(<<"received">>, ViaOpts)),
+    RPort = case nklib_util:get_integer(<<"rport">>, ViaOpts) of
         0 -> ViaPort;
         RPort0 -> RPort0
     end,
-    Transp1 = Transp#transport{proto=ViaProto, remote_ip=RIp, remote_port=RPort},
-    Resp1 = Resp#sipmsg{vias=[Via|RestVias], transport=Transp1},
-    case nksip_transport_uas:send_response(Resp1, []) of
+    NkPort1 = NkPort#nkport{
+        transp = ViaTransp, 
+        remote_ip = RIp, 
+        remote_port = RPort,
+        socket = undefined          % Make use it is not used
+    },
+    Resp1 = Resp#sipmsg{vias=[Via|RestVias], nkport=NkPort1},
+    case nksip_call_uas_transp:send_response(Resp1, []) of
         {ok, _} -> 
             ?call_debug("Stateless proxy sent ~p ~p response", [Method, Code]);
-        error -> 
+        {error, _} -> 
             ?call_notice("Stateless proxy could not send ~p ~p response", 
                          [Method, Code])
     end,
@@ -148,7 +157,7 @@ response_stateless(_, Call) ->
 
 
 %% @private
--spec check_request(nksip:request(), nksip_lib:optslist()) ->
+-spec check_request(nksip:request(), nksip:optslist()) ->
     nksip:request().
 
 check_request(#sipmsg{class={req, Method}, forwards=Forwards}=Req, Opts) ->
@@ -165,7 +174,7 @@ check_request(#sipmsg{class={req, Method}, forwards=Forwards}=Req, Opts) ->
     end,
     case lists:member(path, Opts) of     
         true ->
-            case nksip_sipmsg:supported(Req, <<"path">>) of
+            case nksip_sipmsg:supported(<<"path">>, Req) of
                 true -> ok;
                 false -> throw({reply, {extension_required, <<"path">>}})
             end;
@@ -173,25 +182,6 @@ check_request(#sipmsg{class={req, Method}, forwards=Forwards}=Req, Opts) ->
             ok
     end,
     Req#sipmsg{forwards=Forwards-1}.
-
-
-% %% @private
-% remove_local_routes(AppId, #sipmsg{routes=Routes}=Req) ->
-%     case do_remove_local_routes(AppId, Routes) of
-%         Routes -> Req;
-%         Routes1 -> Req#sipmsg{routes=Routes1}
-%     end.
-
-
-% %% @private
-% do_remove_local_routes(_AppId, []) ->
-%     [];
-
-% do_remove_local_routes(AppId, [Route|RestRoutes]) ->
-%     case nksip_transport:is_local(AppId, Route) of
-%         true -> do_remove_local_routes(AppId, RestRoutes);
-%         false -> [Route|RestRoutes]
-%     end.
 
 
 %% @doc Process a UriSet generating a standard `[[nksip:uri()]]'.
@@ -206,7 +196,7 @@ normalize_uriset(UriSet) when is_binary(UriSet) ->
     [pruris(UriSet)];
 
 normalize_uriset(UriSet) when is_list(UriSet) ->
-    case nksip_lib:is_string(UriSet) of
+    case nklib_util:is_string(UriSet) of
         true -> [pruris(UriSet)];
         false -> normalize_uriset(single, UriSet, [], [])
     end;
@@ -234,13 +224,13 @@ normalize_uriset(multi, [Bin|R], Acc1, Acc2) when is_binary(Bin) ->
     end;
 
 normalize_uriset(single, [List|R], Acc1, Acc2) when is_list(List) -> 
-    case nksip_lib:is_string(List) of
+    case nklib_util:is_string(List) of
         true -> normalize_uriset(single, R, Acc1++pruris(List), Acc2);
         false -> normalize_uriset(multi, [List|R], Acc1, Acc2)
     end;
 
 normalize_uriset(multi, [List|R], Acc1, Acc2) when is_list(List) -> 
-    case nksip_lib:is_string(List) of
+    case nklib_util:is_string(List) of
         true when Acc1==[] ->
             normalize_uriset(multi, R, [], Acc2++[pruris(List)]);
         true ->
@@ -268,7 +258,7 @@ uri2ruri(Uri) ->
     Uri#uri{ext_opts=[], ext_headers=[]}.
 
 pruris(RUri) ->
-    case nksip_parse:uris(RUri) of
+    case nklib_parse:uris(RUri) of
         error -> [];
         RUris -> [uri2ruri(Uri) || Uri <- RUris]
     end.
@@ -285,11 +275,11 @@ pruris(RUri) ->
 
 
 normalize_test() ->
-    UriA = #uri{domain=(<<"a">>)},
-    UriB = #uri{domain=(<<"b">>)},
-    UriC = #uri{domain=(<<"c">>)},
-    UriD = #uri{domain=(<<"d">>)},
-    UriE = #uri{domain=(<<"e">>)},
+    UriA = #uri{scheme=sip, domain=(<<"a">>)},
+    UriB = #uri{scheme=sip, domain=(<<"b">>)},
+    UriC = #uri{scheme=sip, domain=(<<"c">>)},
+    UriD = #uri{scheme=sip, domain=(<<"d">>)},
+    UriE = #uri{scheme=sip, domain=(<<"e">>)},
 
     ?assert(normalize_uriset([]) == [[]]),
     ?assert(normalize_uriset(a) == [[]]),

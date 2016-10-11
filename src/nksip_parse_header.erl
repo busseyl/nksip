@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Carlos Gonzalez Florido.  All Rights Reserved.
+%% Copyright (c) 2015 Carlos Gonzalez Florido.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -18,7 +18,7 @@
 %%
 %% -------------------------------------------------------------------
 
-%% @doc SIP message parsing functions
+%% @private SIP message parsing functions
 %%
 %% This module implements several functions to parse sip requests, responses
 %% headers, uris, vias, etc.
@@ -26,6 +26,7 @@
 -module(nksip_parse_header).
 -author('Carlos Gonzalez <carlosj.gf@gmail.com>').
 
+-include_lib("nklib/include/nklib.hrl").
 -include("nksip.hrl").
 -include("nksip_call.hrl").
 
@@ -42,7 +43,7 @@
 
 %% @doc Parses a header value. 
 %% If Name is binary(), it will is supposed it is canonical; if not sure, 
-%% call `name(Name)`. If it is a string() or atom(), it is  converted to canonical form.
+%% call `name(Name)'. If it is a string() or atom(), it is  converted to canonical form.
 %% Throws {invalid, Name} in case of invalid header.
 -spec parse(binary(), term()) ->
     {binary(), term()}.
@@ -86,8 +87,8 @@ parse(Name, Value, #sipmsg{}=Req, Policy) when is_binary(Name)->
                 Headers = case Policy of
                     pre -> [{Name, Result}|Old]; 
                     post -> Old++[{Name, Result}];
-                    replace when Value == <<>>; Value==[] -> nksip_lib:delete(Old, Name);
-                    replace -> [{Name, Result}|nksip_lib:delete(Old, Name)]
+                    replace when Value == <<>>; Value==[] -> nklib_util:delete(Old, Name);
+                    replace -> [{Name, Result}|nklib_util:delete(Old, Name)]
                 end,
                 Req#sipmsg{headers=Headers}
         end
@@ -104,11 +105,11 @@ headers([], Req, _Policy) ->
     Req;
 
 headers([{<<"body">>, Value}|Rest], Req, Policy) ->
-    Body1 = list_to_binary(http_uri:decode(nksip_lib:to_list(Value))), 
+    Body1 = list_to_binary(http_uri:decode(nklib_util:to_list(Value))), 
     headers(Rest, Req#sipmsg{body=Body1}, Policy);
 
 headers([{Name, Value}|Rest], Req, Policy) ->
-    Value1 = http_uri:decode(nksip_lib:to_list(Value)), 
+    Value1 = http_uri:decode(nklib_util:to_list(Value)), 
     Req1 = parse(Name, Value1, Req, Policy),
     headers(Rest, Req1, Policy);
 
@@ -120,12 +121,12 @@ headers(_, _, _) ->
 %% @private
 header(<<"from">>, Value) -> 
     From = single_uri(Value),
-    FromTag = nksip_lib:get_value(<<"tag">>, From#uri.ext_opts, <<>>),
+    FromTag = nklib_util:get_value(<<"tag">>, From#uri.ext_opts, <<>>),
     {{From, FromTag}, #sipmsg.from};
 
 header(<<"to">>, Value) -> 
     To = single_uri(Value),
-    ToTag = nksip_lib:get_value(<<"tag">>, To#uri.ext_opts, <<>>),
+    ToTag = nklib_util:get_value(<<"tag">>, To#uri.ext_opts, <<>>),
     {{To, ToTag}, #sipmsg.to};
 
 header(<<"via">>, Value) -> 
@@ -138,7 +139,7 @@ header(<<"max-forwards">>, Value) ->
     {integer(Value, 0, 300), #sipmsg.forwards};
 
 header(<<"call-id">>, Value) -> 
-    case nksip_lib:to_binary(Value) of
+    case nklib_util:to_binary(Value) of
         <<>> -> throw(invalid);
         CallId -> {CallId, #sipmsg.call_id}
     end;
@@ -176,7 +177,7 @@ header(<<"event">>, Value) ->
 header(<<"reason">>, Value) ->
     case is_binary(Value) of
         true -> 
-            Value;
+            {Value, add};
         false ->
             case nksip_unparse:error_reason(Value) of
                 error -> throw(invalid);
@@ -194,13 +195,13 @@ header(_Name, Value) ->
 
 
 single_uri(Data) ->
-    case nksip_parse:uris(Data) of
+    case nklib_parse:uris(Data) of
         [#uri{} = Uri] -> Uri;
         _ -> throw(invalid)
     end.
 
 uris(Data) ->
-    case nksip_parse:uris(Data) of
+    case nklib_parse:uris(Data) of
         error -> throw(invalid);
         Uris -> Uris
     end.
@@ -212,27 +213,27 @@ vias(Data) ->
     end.
 
 single_token(Data) ->
-    case nksip_parse:tokens(Data) of
+    case nklib_parse:tokens(Data) of
         [Token] -> Token;
         _ -> throw(invalid)
     end.
 
 % tokens(Data) ->
-%     case nksip_parse:tokens(Data) of
+%     case nklib_parse:tokens(Data) of
 %         error -> throw(invalid);
 %         Tokens -> Tokens
 %     end.
 
 names(Data) ->
-    case nksip_parse:tokens(Data) of
+    case nklib_parse:tokens(Data) of
         error -> throw(invalid);
         Tokens -> [Token || {Token, _} <- Tokens]
     end.
 
 cseq(Data) ->
-    case nksip_lib:tokens(Data) of
+    case nklib_util:words(Data) of
         [CSeq, Method] ->                
-            case nksip_lib:to_integer(CSeq) of
+            case nklib_util:to_integer(CSeq) of
                 Int when is_integer(Int), Int>=0, Int<4294967296 ->
                     {Int, nksip_parse:method(Method)};
                 _ ->
@@ -243,7 +244,7 @@ cseq(Data) ->
     end.
 
 integer(Data, Min, Max) ->
-    case nksip_lib:to_integer(Data) of
+    case nklib_util:to_integer(Data) of
         Int when is_integer(Int), Int>=Min, Int=<Max -> Int;
         _ -> throw(invalid)
     end.
@@ -254,7 +255,7 @@ update_tag({Value, <<>>}, {_, <<>>}) ->
     {Value, <<>>};
 
 update_tag({#uri{ext_opts=ExtOpts}=Value, <<>>}, {_, Tag}) ->
-    ExtOpts1 = nksip_lib:store_value(<<"tag">>, Tag, ExtOpts),
+    ExtOpts1 = nklib_util:store_value(<<"tag">>, Tag, ExtOpts),
     {Value#uri{ext_opts=ExtOpts1}, Tag};
 
 update_tag({Value, Tag}, _) ->
@@ -449,7 +450,7 @@ uri_test() ->
         "&route=sip%3Ar1%2Csip%3Ar2"
         "&body=my%20body&user1=data2"
         "&Route=sip%3Ar3>",
-    [#uri{headers=UriHeaders}] = nksip_parse:uris(Uri),
+    [#uri{headers=UriHeaders}] = nklib_parse:uris(Uri),
 
     Base = #sipmsg{
         from = {#uri{domain = <<"f">>, ext_opts=[{<<"tag">>, <<"f">>}]}, <<"f">>},
